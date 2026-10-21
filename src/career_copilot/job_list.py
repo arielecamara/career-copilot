@@ -173,6 +173,7 @@ class ListedJob(BaseModel):
     partial: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
     assumed: list[AssumedPoint] = Field(default_factory=list)
+    answered: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
     @field_validator("notes")
@@ -250,9 +251,131 @@ def save_trait(ask: str, basis: str, vote: str, path: Path | None = None) -> Non
     trait = Trait(ask=ask, basis=basis, vote=vote)
     kept = [item for item in load_traits(target) if item.ask.casefold() != trait.ask.casefold()]
     kept.append(trait)
+    _write_traits(kept, target)
+
+
+def delete_trait(ask: str, path: Path | None = None) -> None:
+    target = traits_path() if path is None else path
+    kept = [item for item in load_traits(target) if item.ask.casefold() != ask.casefold()]
+    _write_traits(kept, target)
+
+
+def _write_traits(traits: list[Trait], target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"traits": [item.model_dump(mode="json") for item in kept]}
+    payload = {"traits": [item.model_dump(mode="json") for item in traits]}
     target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def revise_job(job: ListedJob, ask: str, basis: str, vote: str | None) -> ListedJob:
+    cleaned_ask = " ".join(ask.split())
+    cleaned_basis = " ".join((basis or ask).split())
+    if not cleaned_ask or vote not in {"up", "down", None}:
+        return job
+    in_partial = any(_same_line(line, cleaned_ask) for line in job.partial)
+    in_assumed = any(_same_line(item.ask, cleaned_ask) for item in job.assumed)
+    in_answered = any(_same_line(line, cleaned_ask) for line in job.answered)
+    in_covered = any(_same_line(line, cleaned_ask) for line in job.covered)
+    in_missing = any(_same_line(line, cleaned_ask) for line in job.missing)
+    if vote == "up":
+        if in_covered and in_answered:
+            return job
+        if not (in_partial or in_assumed or in_answered):
+            return job
+        destination = "match"
+    elif vote == "down":
+        if in_missing and in_answered:
+            return job
+        if not (in_partial or in_assumed or in_answered):
+            return job
+        destination = "missing"
+    elif not in_answered:
+        return job
+    else:
+        destination = "possible"
+    covered = _without_line(job.covered, cleaned_ask)
+    partial = _without_line(job.partial, cleaned_ask)
+    missing = _without_line(job.missing, cleaned_ask)
+    assumed = [item for item in job.assumed if not _same_line(item.ask, cleaned_ask)]
+    answered = _without_line(job.answered, cleaned_ask)
+    if destination == "match":
+        covered.append(cleaned_ask)
+        answered.append(cleaned_ask)
+    elif destination == "missing":
+        missing.append(cleaned_ask)
+        answered.append(cleaned_ask)
+    elif cleaned_basis.casefold() != cleaned_ask.casefold():
+        assumed.append(AssumedPoint(ask=cleaned_ask, basis=cleaned_basis))
+    else:
+        partial.append(cleaned_ask)
+    updated = job.model_copy(
+        update={
+            "covered": covered,
+            "partial": partial,
+            "missing": missing,
+            "assumed": assumed,
+            "answered": answered,
+        }
+    )
+    percent = match_percent(_points_of(updated))
+    if percent is None:
+        percent = job.match_percent
+    return updated.model_copy(update={"match_percent": percent})
+
+
+def record_answer(ask: str, basis: str, vote: str | None, path: Path | None = None) -> None:
+    traits_target = traits_for_jobs(path)
+    if vote is None:
+        delete_trait(ask, traits_target)
+    elif vote in {"up", "down"}:
+        save_trait(ask, basis or ask, vote, traits_target)
+    else:
+        raise CareerCopilotError("The saved traits could not be read.")
+    log = load_log(path)
+    log.kept = [revise_job(job, ask, basis, vote) for job in log.kept]
+    log.latest = [revise_job(job, ask, basis, vote) for job in log.latest]
+    save_log(log, path)
+
+
+def apply_saved_traits(path: Path | None = None) -> None:
+    traits = load_traits(traits_for_jobs(path))
+    if not traits:
+        return
+    log = load_log(path)
+    if not log.kept and not log.latest:
+        return
+    changed = False
+
+    def fold(job: ListedJob) -> ListedJob:
+        nonlocal changed
+        current = job
+        for trait in traits:
+            revised = revise_job(current, trait.ask, trait.basis, trait.vote)
+            if revised != current:
+                changed = True
+                current = revised
+        return current
+
+    kept = [fold(job) for job in log.kept]
+    latest = [fold(job) for job in log.latest]
+    if changed:
+        log.kept = kept
+        log.latest = latest
+        save_log(log, path)
+
+
+def _same_line(left: str, right: str) -> bool:
+    return left.casefold() == right.casefold()
+
+
+def _without_line(lines: list[str], ask: str) -> list[str]:
+    return [line for line in lines if not _same_line(line, ask)]
+
+
+def _points_of(job: ListedJob) -> list[MatchPoint]:
+    points = [MatchPoint(text=line, status="match") for line in job.covered]
+    points.extend(MatchPoint(text=line, status="partial") for line in job.partial)
+    points.extend(MatchPoint(text=line, status="no_match") for line in job.missing)
+    return points
 
 
 def load_log(path: Path | None = None) -> SearchLog:
@@ -313,6 +436,9 @@ def visible_jobs(log: SearchLog) -> list[ListedJob]:
             add(job)
     elif log.reason == FALLBACK_REASON and latest:
         add(max(latest, key=lambda job: job.match_percent))
+    for job in latest:
+        if job.answered and job.match_percent < MIN_MATCH:
+            add(job)
     return jobs
 
 
@@ -445,17 +571,17 @@ def real_search(
     traits = load_traits(traits_for_jobs(path))
     batch = candidates[:8]
     for opening in batch:
-        points = _apply_traits(
-            _calm_points(list(score(cleaned, _scoring_text(opening.text, roles, conditions)))),
+        judged, answered = _judge(
+            list(score(cleaned, _scoring_text(opening.text, roles, conditions))),
             traits,
         )
-        points.extend(_condition_gaps(opening, conditions))
-        points.extend(_language_gap(opening, conditions))
-        percent = match_percent(points)
+        judged.extend(_condition_gaps(opening, conditions))
+        judged.extend(_language_gap(opening, conditions))
+        percent = match_percent(judged)
         if percent is None:
             continue
         if _accept_percent(percent, opening, conditions):
-            found.append(_listed(opening, percent, points, conditions))
+            found.append(_listed(opening, percent, judged, conditions, answered=answered))
         else:
             below += 1
     found.sort(key=lambda job: job.match_percent, reverse=True)
@@ -530,18 +656,19 @@ def _search_web(
             if "too long" not in str(exc).casefold():
                 raise
             break
-        points = _apply_traits(_calm_points(raw), traits)
-        points.extend(_condition_gaps(opening, conditions))
-        points.extend(_language_gap(opening, conditions))
-        points.extend(_level_gap(opening, conditions))
-        percent = match_percent(points)
+        judged, answered = _judge(raw, traits)
+        judged.extend(_condition_gaps(opening, conditions))
+        judged.extend(_language_gap(opening, conditions))
+        judged.extend(_level_gap(opening, conditions))
+        percent = match_percent(judged)
         if percent is None:
             continue
         listed = _listed(
             opening,
             percent,
-            points,
+            judged,
             conditions,
+            answered=answered,
             deadline_missing=_needs_deadline_note(opening),
         )
         if percent >= MIN_MATCH:
@@ -635,16 +762,16 @@ def consider_posting(
     existing = next((job for job in log.kept + log.latest if job_key(job) == key), None)
     if existing is not None:
         return PasteOutcome(note="This posting is already on the list.", job=existing)
-    points = _apply_traits(
-        _calm_points(list(score(cleaned, _scoring_text(opening.text, roles, conditions)))),
+    judged, answered = _judge(
+        list(score(cleaned, _scoring_text(opening.text, roles, conditions))),
         load_traits(traits_for_jobs(path)),
     )
-    points.extend(_condition_gaps(opening, conditions))
-    points.extend(_language_gap(opening, conditions))
-    percent = match_percent(points)
+    judged.extend(_condition_gaps(opening, conditions))
+    judged.extend(_language_gap(opening, conditions))
+    percent = match_percent(judged)
     if percent is None:
         return PasteOutcome(note="This posting could not be scored.")
-    listed = _listed(opening, percent, points, conditions)
+    listed = _listed(opening, percent, judged, conditions, answered=answered)
     log.latest.append(listed)
     log.latest.sort(key=lambda job: job.match_percent, reverse=True)
     log.found_count = len(log.latest)
@@ -868,6 +995,7 @@ def _listed(
     points: list[MatchPoint],
     conditions: SearchConditions | None = None,
     *,
+    answered: list[str] | None = None,
     deadline_missing: bool = False,
 ) -> ListedJob:
     notes = _notes(opening, conditions)
@@ -889,6 +1017,7 @@ def _listed(
         partial=[point.text for point in points if point.status == "partial"],
         missing=[point.text for point in points if point.status == "no_match"],
         assumed=assumed,
+        answered=list(answered or []),
         notes=notes,
     )
 
@@ -908,6 +1037,21 @@ def _apply_traits(points: list[MatchPoint], traits: list[Trait]) -> list[MatchPo
             continue
         prepared.append(point)
     return prepared
+
+
+def _judge(points: list[MatchPoint], traits: list[Trait]) -> tuple[list[MatchPoint], list[str]]:
+    calmed = _calm_points(points)
+    adjusted = _apply_traits(calmed, traits)
+    return adjusted, _trait_answers(calmed, adjusted)
+
+
+def _trait_answers(before: list[MatchPoint], after: list[MatchPoint]) -> list[str]:
+    prior = {point.text.casefold(): point.status for point in before}
+    names: list[str] = []
+    for point in after:
+        if prior.get(point.text.casefold()) in {"partial", "assumed"} and point.status in {"match", "no_match"}:
+            names.append(point.text)
+    return names
 
 
 def _opening_points(

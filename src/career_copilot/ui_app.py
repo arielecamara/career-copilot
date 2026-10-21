@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import date
 from pathlib import Path
 
@@ -35,12 +36,13 @@ from career_copilot.job_list import (
     load_log,
     load_traits,
     notes_for_display,
+    record_answer,
+    apply_saved_traits,
     posting_place,
     posting_workplace,
     deadline_on,
     real_search,
     requested_documents,
-    save_trait,
     score_posting,
     short_line,
     visible_jobs,
@@ -375,10 +377,11 @@ def _page_jobs(st) -> None:
                 _run_paste(st, cv_text, roles, conditions)
             result = st.session_state.get("paste-result")
             if isinstance(result, ListedJob):
-                _job_result(st, result)
+                _job_result(st, result, prefix="paste")
+    apply_saved_traits()
     log = load_log()
+    _refresh_paste(st, log)
     jobs = visible_jobs(log)
-    st.caption("+ keeps the opened job. − removes it. A new search keeps the jobs you kept.")
     if jobs:
         st.table(
             {
@@ -412,13 +415,6 @@ def _page_jobs(st) -> None:
         choice = st.radio("Open a job", labels, key="open-job")
         selected = jobs[labels.index(choice)] if choice in labels else jobs[0]
         _job_detail(st, selected)
-        keep_col, drop_col = st.columns(2)
-        if keep_col.button("+", key="keep-open"):
-            keep_job(selected)
-            st.rerun()
-        if drop_col.button("−", key="drop-open"):
-            drop_job(selected)
-            st.rerun()
 
 
 def _stored_cv(st) -> str:
@@ -438,37 +434,55 @@ def _session_cv(st) -> str:
     return text.strip()
 
 
+def _refresh_paste(st, log) -> None:
+    result = st.session_state.get("paste-result")
+    if not isinstance(result, ListedJob):
+        return
+    for job in [*log.kept, *log.latest]:
+        if job_key(job) == job_key(result):
+            st.session_state["paste-result"] = job
+            return
+
+
+def _store_answer(st, ask: str, basis: str, vote: str | None) -> None:
+    record_answer(ask, basis, vote)
+    st.rerun()
+
+
 def _possible_rows(job: ListedJob) -> list[tuple[str, str]]:
     rows = [(line, "") for line in job.partial]
     rows.extend((item.ask, item.basis) for item in job.assumed)
     return rows
 
 
-def _possible_block(st, job: ListedJob) -> None:
-    votes = {item.ask.casefold(): item.vote for item in load_traits()}
-    pending = [(ask, basis) for ask, basis in _possible_rows(job) if votes.get(ask.casefold()) not in {"up", "down"}]
-    saved = any(votes.get(ask.casefold()) in {"up", "down"} for ask, _basis in _possible_rows(job))
-    if not pending and not saved:
+def _possible_block(st, job: ListedJob, prefix: str) -> None:
+    rows = _possible_rows(job)
+    if not rows:
         return
     st.subheader("Possible matches")
-    if saved:
-        st.caption("Saved for the next search.")
-    for index, (ask, basis) in enumerate(pending):
+    for index, (ask, basis) in enumerate(rows):
         if basis and basis.casefold() != ask.casefold():
             st.markdown(f"- {ask} — {basis}")
         else:
             st.markdown(f"- {ask}")
         yes_col, no_col = st.columns(2)
-        if yes_col.button("Yes", key=f"trait-up-{job_key(job)}-{index}"):
-            save_trait(ask, basis or ask, "up")
-            st.rerun()
-        if no_col.button("No", key=f"trait-down-{job_key(job)}-{index}"):
-            save_trait(ask, basis or ask, "down")
-            st.rerun()
+        token = f"{prefix}-{job_key(job)}-{index}"
+        if yes_col.button("Yes", key=f"trait-up-{token}"):
+            _store_answer(st, ask, basis, "up")
+        if no_col.button("No", key=f"trait-down-{token}"):
+            _store_answer(st, ask, basis, "down")
 
 
-def _job_result(st, job: ListedJob) -> None:
+def _job_result(st, job: ListedJob, *, actions: bool = False, prefix: str = "open") -> None:
     st.subheader(job.title)
+    if actions:
+        keep_col, drop_col = st.columns(2)
+        if keep_col.button("Keep this job", key="keep-open"):
+            keep_job(job)
+            st.rerun()
+        if drop_col.button("Remove this job", key="drop-open"):
+            drop_job(job)
+            st.rerun()
     place = posting_place(job.description)
     workplace = posting_workplace(job.description)
     details = [part for part in (job.company, place, workplace, job.source) if part]
@@ -489,7 +503,7 @@ def _job_result(st, job: ListedJob) -> None:
             st.markdown(f"- {line}")
     else:
         st.caption("No judged requirement matches.")
-    _possible_block(st, job)
+    _possible_block(st, job, prefix)
     st.subheader("What is missing")
     if job.missing:
         for line in job.missing:
@@ -510,7 +524,7 @@ def _job_result(st, job: ListedJob) -> None:
 
 
 def _job_detail(st, job: ListedJob) -> None:
-    _job_result(st, job)
+    _job_result(st, job, actions=True, prefix="open")
 
 
 def _run_real_search(st, cv_text: str, roles: list[WorkRole], conditions) -> None:
@@ -586,6 +600,45 @@ def _stored_search_file():
         return None
 
 
+def _answer_token(ask: str) -> str:
+    return hashlib.sha256(ask.casefold().encode("utf-8")).hexdigest()[:16]
+
+
+def _saved_answers(st) -> None:
+    try:
+        traits = load_traits()
+    except CareerCopilotError:
+        st.caption("The saved answers could not be read.")
+        return
+    st.markdown("**Strengths**")
+    st.caption("Yes on a possible match is a strength. No is a gap. A line without an answer stays on that job only.")
+    strengths = [trait for trait in traits if trait.vote == "up"]
+    gaps = [trait for trait in traits if trait.vote == "down"]
+    if strengths:
+        for trait in strengths:
+            _answer_row(st, trait, "Move to gaps", "down")
+    else:
+        st.caption("No strength saved.")
+    st.markdown("**Gaps**")
+    if gaps:
+        for trait in gaps:
+            _answer_row(st, trait, "Move to strengths", "up")
+    else:
+        st.caption("No gap saved.")
+
+
+def _answer_row(st, trait, switch_label: str, switch_vote: str) -> None:
+    st.markdown(f"- {trait.ask}")
+    if trait.basis.casefold() != trait.ask.casefold():
+        st.caption(trait.basis)
+    token = _answer_token(trait.ask)
+    switch_col, clear_col = st.columns(2)
+    if switch_col.button(switch_label, key=f"trait-switch-{token}"):
+        _store_answer(st, trait.ask, trait.basis, switch_vote)
+    if clear_col.button("Clear", key=f"trait-clear-{token}"):
+        _store_answer(st, trait.ask, trait.basis, None)
+
+
 def _profile_card(st, roles: list[WorkRole], conditions) -> None:
     with st.container(border=True):
         st.subheader("Profile")
@@ -601,6 +654,7 @@ def _profile_card(st, roles: list[WorkRole], conditions) -> None:
         st.markdown("**Languages**")
         st.markdown(conditions.languages.strip() or "Not set")
         st.text_area("Other notes", key="search-notes", height=140, max_chars=_NOTES_LIMIT)
+        _saved_answers(st)
         if st.button("Save profile"):
             try:
                 _save_profile(st, conditions)

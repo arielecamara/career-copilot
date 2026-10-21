@@ -15,6 +15,7 @@ from career_copilot.job_list import (
     HIGH_MATCH,
     SEARCH_TIMEOUT_SECONDS,
     WEB_SHOWN,
+    AssumedPoint,
     ListedJob,
     MatchPoint,
     SearchLog,
@@ -40,6 +41,7 @@ from career_copilot.job_list import (
     parse_remoteok,
     parse_remotive,
     real_search,
+    record_answer,
     requested_documents,
     save_log,
     save_trait,
@@ -717,8 +719,12 @@ def test_jobs_page_has_no_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert "Related research" in visible
     assert "Read the CV on the User page first." in visible
     assert "Remotive" in visible
-    assert "+" in labels
-    assert "−" in labels
+    assert "Keep this job" in labels
+    assert "Remove this job" in labels
+    assert "+" not in labels
+    assert "−" not in labels
+    assert "No strength saved." in visible
+    assert "No gap saved." in visible
     assert "Automatic search" in labels
     assert "Manual search" in labels
     assert "The posting does not mention the employment type." in visible
@@ -1421,6 +1427,7 @@ def test_a_yes_on_a_possible_match_counts_on_the_next_search(tmp_path: Path):
         require_grok=False,
     )
     assert first.latest[0].partial == ["PhD in GIScience or a related field"]
+    assert first.latest[0].answered == []
     assert first.latest[0].match_percent == 75
     save_trait("PhD in GIScience or a related field", "PhD in GIScience or a related field", "up", tmp_path / "traits.json")
     second = real_search(
@@ -1435,6 +1442,7 @@ def test_a_yes_on_a_possible_match_counts_on_the_next_search(tmp_path: Path):
     )
     assert second.latest[0].match_percent == 100
     assert second.latest[0].partial == []
+    assert second.latest[0].answered == ["PhD in GIScience or a related field"]
     assert "PhD in GIScience or a related field" in second.latest[0].covered
     save_trait("PhD in GIScience or a related field", "PhD in GIScience or a related field", "down", tmp_path / "traits.json")
     third = real_search(
@@ -1449,4 +1457,197 @@ def test_a_yes_on_a_possible_match_counts_on_the_next_search(tmp_path: Path):
     )
     assert third.latest[0].match_percent == 50
     assert third.latest[0].partial == []
+    assert third.latest[0].answered == ["PhD in GIScience or a related field"]
     assert "PhD in GIScience or a related field" in third.latest[0].missing
+
+
+def _sample_job() -> ListedJob:
+    return ListedJob(
+        title="Researcher",
+        company="Lab",
+        url="https://example.com/jobs/open",
+        source="Web",
+        match_percent=50,
+        description="Remote research.",
+        covered=["Neo4j"],
+        partial=["PhD in GIScience or a related field", "Teaching experience"],
+        missing=["A license"],
+    )
+
+
+def test_yes_moves_the_line_now_and_an_unanswered_line_stays_off_the_profile(tmp_path: Path):
+    path = tmp_path / "jobs.json"
+    other = ListedJob(
+        title="Graph engineer",
+        company="Lab",
+        url="https://example.com/jobs/graph",
+        source="Web",
+        match_percent=100,
+        description="Remote research.",
+        covered=["PhD in GIScience or a related field"],
+    )
+    save_log(SearchLog(latest=[_sample_job(), other]), path)
+    record_answer(
+        "PhD in GIScience or a related field",
+        "PhD in GIScience or a related field",
+        "up",
+        path,
+    )
+    log = load_log(path)
+    voted = log.latest[0]
+    assert "PhD in GIScience or a related field" in voted.covered
+    assert voted.partial == ["Teaching experience"]
+    assert "PhD in GIScience or a related field" not in voted.missing
+    assert voted.answered == ["PhD in GIScience or a related field"]
+    assert voted.match_percent == match_percent(
+        [
+            MatchPoint(text="Neo4j", status="match"),
+            MatchPoint(text="PhD in GIScience or a related field", status="match"),
+            MatchPoint(text="Teaching experience", status="partial"),
+            MatchPoint(text="A license", status="no_match"),
+        ]
+    )
+    saved = load_traits(path.with_name("traits.json"))
+    assert [trait.ask for trait in saved] == ["PhD in GIScience or a related field"]
+    assert saved[0].vote == "up"
+    assert "Teaching experience" not in path.with_name("traits.json").read_text(encoding="utf-8")
+    untouched = log.latest[1]
+    assert untouched.covered == ["PhD in GIScience or a related field"]
+    assert untouched.answered == []
+    assert untouched.match_percent == 100
+    record_answer(
+        "PhD in GIScience or a related field",
+        "PhD in GIScience or a related field",
+        "down",
+        path,
+    )
+    lowered_log = load_log(path)
+    lowered = lowered_log.latest[0]
+    assert "PhD in GIScience or a related field" in lowered.missing
+    assert "PhD in GIScience or a related field" not in lowered.covered
+    assert lowered.match_percent < 50
+    assert lowered in visible_jobs(lowered_log)
+    assert lowered_log.latest[1].covered == ["PhD in GIScience or a related field"]
+    assert lowered_log.latest[1].match_percent == 100
+    record_answer("PhD in GIScience or a related field", "PhD in GIScience or a related field", None, path)
+    cleared = load_log(path).latest[0]
+    assert cleared.partial == ["Teaching experience", "PhD in GIScience or a related field"]
+    assert cleared.answered == []
+    assert load_traits(path.with_name("traits.json")) == []
+    assert cleared.match_percent == 50
+
+
+def test_clearing_an_assumed_answer_puts_the_line_back(tmp_path: Path):
+    path = tmp_path / "jobs.json"
+    save_log(
+        SearchLog(
+            latest=[
+                ListedJob(
+                    title="Researcher",
+                    company="Lab",
+                    url="https://example.com/jobs/assumed",
+                    source="Web",
+                    match_percent=50,
+                    description="Remote research.",
+                    covered=["Neo4j"],
+                    missing=["License"],
+                    assumed=[AssumedPoint(ask="Works independently", basis="PhD")],
+                )
+            ]
+        ),
+        path,
+    )
+    record_answer("Works independently", "PhD", "up", path)
+    agreed = load_log(path).latest[0]
+    assert agreed.assumed == []
+    assert "Works independently" in agreed.covered
+    assert agreed.match_percent == 67
+    record_answer("Works independently", "PhD", None, path)
+    restored = load_log(path).latest[0]
+    assert restored.assumed[0].ask == "Works independently"
+    assert restored.assumed[0].basis == "PhD"
+    assert "Works independently" not in restored.covered
+    assert restored.match_percent == 50
+    assert load_traits(path.with_name("traits.json")) == []
+
+
+def test_a_saved_answer_moves_an_older_job_when_the_page_opens(tmp_path: Path):
+    path = tmp_path / "jobs.json"
+    save_log(SearchLog(latest=[_sample_job()]), path)
+    save_trait(
+        "PhD in GIScience or a related field",
+        "PhD in GIScience or a related field",
+        "up",
+        path.with_name("traits.json"),
+    )
+    from career_copilot.job_list import apply_saved_traits
+
+    apply_saved_traits(path)
+    moved = load_log(path).latest[0]
+    assert "PhD in GIScience or a related field" in moved.covered
+    apply_saved_traits(path)
+    again = load_log(path).latest[0]
+    assert again == moved
+
+
+def test_yes_on_the_job_page_moves_the_line_into_what_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("streamlit")
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    monkeypatch.chdir(tmp_path)
+    save_roles(tmp_path / ".career-copilot" / "roles.json", _roles())
+    save_search(_remote(), tmp_path / ".career-copilot" / "search.json")
+    save_log(
+        SearchLog(
+            latest=[
+                ListedJob(
+                    title="Researcher",
+                    company="Lab",
+                    url="https://example.com/jobs/open",
+                    source="Web",
+                    match_percent=50,
+                    description="Remote research.",
+                    covered=["Research"],
+                    partial=["Related research"],
+                    missing=["A license"],
+                )
+            ]
+        ),
+        tmp_path / ".career-copilot" / "jobs.json",
+    )
+    script = Path(__file__).parents[1] / "src" / "career_copilot" / "ui_app.py"
+    app = AppTest.from_file(str(script), default_timeout=60)
+    app.run()
+    app.sidebar.radio[0].set_value("Jobs").run()
+    assert not app.exception, app.exception
+    next(item for item in app.button if item.label == "Yes").click().run()
+    assert not app.exception, app.exception
+    visible = "\n".join(
+        str(item.value)
+        for item in list(app.markdown) + list(app.caption) + list(app.subheader)
+    )
+    assert "Possible matches" not in visible
+    assert "Related research" in visible
+    assert "Match: 67%" in visible
+    assert "What matches" in visible
+    assert "Strengths" in visible
+    traits = (tmp_path / ".career-copilot" / "traits.json").read_text(encoding="utf-8")
+    assert "Related research" in traits
+    assert '"vote": "up"' in traits
+    next(item for item in app.button if item.label == "Move to gaps").click().run()
+    assert not app.exception, app.exception
+    moved = "\n".join(str(item.value) for item in list(app.subheader) + list(app.markdown))
+    assert "Match: 33%" in moved
+    assert "Related research" in moved
+    assert "Researcher" in moved
+    gap_traits = (tmp_path / ".career-copilot" / "traits.json").read_text(encoding="utf-8")
+    assert '"vote": "down"' in gap_traits
+    next(item for item in app.button if item.label == "Clear").click().run()
+    assert not app.exception, app.exception
+    cleared = "\n".join(str(item.value) for item in list(app.subheader) + list(app.markdown) + list(app.caption))
+    assert "Possible matches" in cleared
+    assert "Match: 50%" in cleared
+    assert "No strength saved." in cleared
+    assert "No gap saved." in cleared
+    assert load_traits(tmp_path / ".career-copilot" / "traits.json") == []
