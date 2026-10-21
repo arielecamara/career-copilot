@@ -84,7 +84,10 @@ def test_the_open_page_is_the_user_role_page(tmp_path: Path, monkeypatch: pytest
     assert "Continue" not in labels
     assert "Analyze" not in labels
     pages = app.sidebar.radio[0].options
-    assert pages == ["User", "Search", "Jobs"]
+    assert pages == ["User", "Search", "Jobs", "Documents"]
+    app.sidebar.radio[0].set_value("Documents").run()
+    assert not app.exception, app.exception
+    assert any("No CV has been written yet." in str(item.value) for item in app.caption)
 
 
 def test_the_page_hides_paths_and_unexpected_errors(tmp_path: Path):

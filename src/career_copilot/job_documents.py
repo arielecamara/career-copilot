@@ -57,7 +57,9 @@ _CHANGE_VERB = r"change|edit|rewrite|update|add|remove|delete|alter|fix|shorten|
 _ACRONYM = re.compile(r"\b(?:[A-Z]{2,}|PhD|Ph\.D\.)\b")
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
 _PROPER = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
+_CAMEL = re.compile(r"\b[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*\b")
 _GROK_TIMEOUT_SECONDS = 180
+_LEFT_AS_WRITTEN = "The summary and the skills were left as written in your CV."
 
 
 @dataclass(frozen=True)
@@ -138,7 +140,10 @@ def grounded_sentence(sentence: str, cv_text: str) -> bool:
         if token.casefold() not in cv_folded:
             return False
     for phrase in _PROPER.findall(cleaned):
-        if phrase.casefold() not in cv_folded:
+        if phrase.casefold() not in cv_folded and not _same_skill(phrase, cv_text):
+            return False
+    for token in _CAMEL.findall(cleaned):
+        if token.casefold() not in cv_folded:
             return False
     return True
 
@@ -152,16 +157,69 @@ def keep_skills(proposed: str, cv_text: str) -> str:
     kept: list[str] = []
     seen: set[str] = set()
     for item in _skill_items(proposed):
-        if item.casefold() not in cv_text.casefold():
+        if not _skill_allowed(item, cv_text):
             continue
-        if not grounded_sentence(item, cv_text):
-            continue
-        key = item.casefold()
+        key = _skill_key(item)
         if key in seen:
             continue
         seen.add(key)
         kept.append(item)
     return "\n".join(kept)
+
+
+def _skill_allowed(item: str, cv_text: str) -> bool:
+    if item.casefold() in cv_text.casefold():
+        return grounded_sentence(item, cv_text)
+    return _same_skill(item, cv_text) and _variant_is_grounded(item, cv_text)
+
+
+def _variant_is_grounded(item: str, cv_text: str) -> bool:
+    cleaned = " ".join(item.split())
+    cv_folded = cv_text.casefold()
+    for number in _NUMBER.findall(cleaned):
+        plain = number.replace(",", "")
+        if number not in cv_text and plain not in cv_text:
+            return False
+    for month in _MONTHS:
+        if re.search(rf"\b{month}\b", cleaned.casefold()) and month not in cv_folded:
+            return False
+    cv_skills = {skill.casefold() for skill in skills_in_text(cv_text, list(SKILL_LEXICON))}
+    for skill in skills_in_text(cleaned, list(SKILL_LEXICON)):
+        if skill.casefold() not in cv_skills and not _same_skill(skill, cv_text):
+            return False
+    for token in _ACRONYM.findall(cleaned):
+        if token.casefold() not in cv_folded and not _same_skill(token, cv_text):
+            return False
+    for token in _CAMEL.findall(cleaned):
+        if token.casefold() not in cv_folded:
+            return False
+    return True
+
+
+def _same_skill(item: str, cv_text: str) -> bool:
+    wanted = _fold_phrase(item)
+    if not wanted:
+        return False
+    haystack = _fold_phrase(cv_text)
+    width = len(wanted)
+    for index in range(len(haystack) - width + 1):
+        if haystack[index : index + width] == wanted:
+            return True
+    return False
+
+
+def _skill_key(item: str) -> str:
+    return " ".join(_fold_phrase(item))
+
+
+def _fold_phrase(text: str) -> list[str]:
+    return [_fold_token(word) for word in re.findall(r"[a-z0-9+#]+", text.casefold())]
+
+
+def _fold_token(word: str) -> str:
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
 
 
 def assemble_cv(cv_text: str, summary: str, skills: str) -> str:
@@ -203,11 +261,22 @@ def generate_job_cv(
     if not original:
         raise CareerCopilotError("Read the CV on the User page first.")
     parts = split_cv(original)
-    summary, skills = _proposed(original, posting, "", propose)
-    summary = keep_summary(summary, original) or _original_body(parts, "summary")
-    skills = keep_skills(skills, original) or _original_body(parts, "skills")
+    notice = ""
+    try:
+        summary, skills = _proposed(original, posting, "", propose)
+    except CareerCopilotError as exc:
+        summary, skills = "", ""
+        notice = _notice_for(exc)
+    kept_summary = keep_summary(summary, original)
+    kept_skills = keep_skills(skills, original)
+    if not kept_summary.strip() and not kept_skills.strip():
+        notice = notice or _LEFT_AS_WRITTEN
+    summary = kept_summary or _original_body(parts, "summary")
+    skills = kept_skills or _original_body(parts, "skills")
     preview = assemble_cv(original, summary, skills)
-    return _store_cv(key, preview, summary, skills, root)
+    path = _store_cv(key, preview, summary, skills, root)
+    _replace_text(path.with_name("cv-notice.txt"), f"{notice.strip()}\n" if notice.strip() else "")
+    return path
 
 
 def apply_cv_note(
@@ -245,7 +314,9 @@ def apply_cv_note(
     preview = assemble_cv(original, summary, skills)
     if preview == before:
         raise CareerCopilotError("The note did not change the file.")
-    return _store_cv(key, preview, summary, skills, root)
+    path = _store_cv(key, preview, summary, skills, root)
+    _replace_text(path.with_name("cv-notice.txt"), "")
+    return path
 
 
 def generate_cover_letter(
@@ -290,11 +361,20 @@ def propose_cv_sections(cv_text: str, posting: str, note: str) -> tuple[str, str
 
 
 def propose_cover_letter(cv_text: str, posting: str) -> str:
-    payload = _ask_grok(_letter_prompt(cv_text, posting))
+    payload = _ask_grok(_letter_prompt(cv_text, posting), missing="The cover letter could not be written.")
     letter = payload.get("letter")
     if not isinstance(letter, str) or not letter.strip():
         raise CareerCopilotError("The cover letter could not be written.")
     return letter
+
+
+def _notice_for(exc: CareerCopilotError) -> str:
+    text = str(exc).casefold()
+    if "too long" in text:
+        return f"Grok took too long. {_LEFT_AS_WRITTEN}"
+    if "not available" in text:
+        return f"Grok is not available in the terminal. Run grok login, then try again. {_LEFT_AS_WRITTEN}"
+    return _LEFT_AS_WRITTEN
 
 
 def write_amsterdam_pdf(path: Path, text: str, *, title: str) -> None:
@@ -478,7 +558,12 @@ def _fonts() -> tuple[str, str]:
     return "Times-Roman", "Times-Bold"
 
 
-def _ask_grok(prompt: str, runner: Callable[..., subprocess.CompletedProcess[str]] | None = None) -> dict[str, object]:
+def _ask_grok(
+    prompt: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    *,
+    missing: str = "The CV could not be written.",
+) -> dict[str, object]:
     executable = shutil.which("grok")
     if executable is None:
         raise CareerCopilotError("Grok is not available in the terminal. Run grok login, then try again.")
@@ -501,11 +586,20 @@ def _ask_grok(prompt: str, runner: Callable[..., subprocess.CompletedProcess[str
         except subprocess.TimeoutExpired as exc:
             raise CareerCopilotError("Grok took too long. Nothing was saved.") from exc
     if completed.returncode != 0:
-        raise CareerCopilotError("The CV could not be written.")
-    return _json_object(completed.stdout or "")
+        raise CareerCopilotError(missing)
+    return _unwrap(_json_object(completed.stdout or "", missing), missing)
 
 
-def _json_object(text: str) -> dict[str, object]:
+def _unwrap(payload: dict[str, object], missing: str) -> dict[str, object]:
+    text = payload.get("text")
+    if not isinstance(text, str):
+        return payload
+    if any(key in payload for key in ("summary", "skills", "letter")):
+        return payload
+    return _json_object(text, missing)
+
+
+def _json_object(text: str, missing: str = "The CV could not be written.") -> dict[str, object]:
     raw = text.strip()
     if raw.startswith("```"):
         raw = raw.removeprefix("```json").removeprefix("```").strip()
@@ -514,13 +608,13 @@ def _json_object(text: str) -> dict[str, object]:
     start = raw.find("{")
     end = raw.rfind("}")
     if start < 0 or end <= start:
-        raise CareerCopilotError("The CV could not be written.")
+        raise CareerCopilotError(missing)
     try:
         payload = json.loads(raw[start : end + 1])
     except json.JSONDecodeError as exc:
-        raise CareerCopilotError("The CV could not be written.") from exc
+        raise CareerCopilotError(missing) from exc
     if not isinstance(payload, dict):
-        raise CareerCopilotError("The CV could not be written.")
+        raise CareerCopilotError(missing)
     return payload
 
 
@@ -532,7 +626,11 @@ def _cv_prompt(cv_text: str, posting: str, note: str) -> str:
         '{"summary":"one or two sentences","skills":"Python\\nSQL"}\n'
         "Rules:\n"
         "- Use only facts already written in the CV.\n"
+        "- Lead with the CV facts that this job asks about.\n"
+        "- When the CV already contains a skill, write it with the job's wording.\n"
+        "- A plural or singular form of that same skill is allowed.\n"
         "- Do not add an employer, title, date, number, or skill that the CV does not contain.\n"
+        "- A related idea is not the same skill.\n"
         "- Do not write experience, education, publications, languages, or contact details.\n"
         "- The note may ask for a change to the summary or the skills only.\n"
         f"Note:\n{guidance}\n"

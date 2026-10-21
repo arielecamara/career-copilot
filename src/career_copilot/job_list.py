@@ -37,9 +37,12 @@ MAX_FETCHED = 12
 WEB_SCORED = 4
 WEB_SHOWN = 3
 SEARCH_TIMEOUT_SECONDS = 240
+_SCORE_RESERVE_SECONDS = 40
 FALLBACK_REASON = "Nada foi encontrado, então retornamos a vaga com o maior match com o seu CV."
 EMPTY_REASON = "Nada foi encontrado."
 DEADLINE_NOTE = "The application deadline was not found."
+_POSTING_CAP = 8000
+_FETCH_CAP = 24000
 _score_budget: ContextVar[int | None] = ContextVar("score_budget", default=None)
 PRIMARY_FEEDS = ("Remotive", "Arbeitnow")
 EXTRA_FEEDS = ("Himalayas", "Jobicy", "Remote OK")
@@ -505,10 +508,15 @@ def fits_employment(stated: list[str], conditions: SearchConditions) -> bool:
 def fits_language(text: str, conditions: SearchConditions) -> bool:
     if not conditions.languages.strip():
         return True
-    hard = _hard_languages(text)
+    cleaned = strip_page_chrome(text)
+    spoken = _user_languages(conditions.languages)
+    body = body_language(cleaned)
+    if body and body not in spoken:
+        return False
+    hard = _hard_languages(cleaned)
     if not hard:
         return True
-    return hard <= _user_languages(conditions.languages)
+    return hard <= spoken
 
 
 def short_line(below: int) -> str:
@@ -619,28 +627,54 @@ def _search_web(
     def remaining() -> int:
         return max(0, SEARCH_TIMEOUT_SECONDS - int(time.monotonic() - started))
 
-    if discover is None:
+    removed = sorted(url for url in blocked if url.startswith("https://"))
+    failures: list[CareerCopilotError] = []
+
+    def collect(avoid: list[str], *, again: bool) -> list[_Opening]:
+        if discover is not None:
+            progress("Searching.")
+            return list(discover())
         try:
-            discovered = _discover_with_grok(
+            return _discover_with_grok(
                 roles,
                 conditions,
                 skills,
                 cv_text=cv_text,
-                timeout_seconds=max(1, remaining()),
+                timeout_seconds=max(1, _discovery_budget(remaining())),
                 progress=progress,
+                skipped=avoid,
+                again=again,
+                time_left=remaining,
             )
         except CareerCopilotError as exc:
-            if "too long" not in str(exc).casefold():
+            message = str(exc).casefold()
+            if "too long" not in message and "did not return a search" not in message:
                 raise
-            discovered = []
-    else:
-        progress("Searching.")
-        discovered = discover()
-    candidates = [
-        opening
-        for opening in discovered
-        if opening.url not in blocked and _web_candidate(opening, cv_text, roles, skills, today)
-    ]
+            failures.append(exc)
+            return []
+
+    def usable(openings: list[_Opening]) -> list[_Opening]:
+        prepared = [_with_posting(opening) for opening in openings]
+        return [
+            opening
+            for opening in prepared
+            if opening.url not in blocked
+            and fits_language(opening.text, conditions)
+            and _web_candidate(opening, cv_text, roles, skills, today)
+        ]
+
+    started_search = time.monotonic()
+    found_pages = collect(removed, again=False)
+    saw_pages = bool(found_pages)
+    candidates = usable(found_pages)
+    quick_miss = not candidates and (time.monotonic() - started_search) < 45 and remaining() >= 90
+    if discover is None and quick_miss:
+        seen = sorted({*removed, *(opening.url for opening in found_pages if opening.url.startswith("https://"))})
+        found_pages = collect(seen, again=True)
+        saw_pages = saw_pages or bool(found_pages)
+        candidates = usable(found_pages)
+    if discover is None and not candidates and not saw_pages and failures:
+        raise failures[-1]
     traits = load_traits(traits_for_jobs(path))
     qualified: list[ListedJob] = []
     weaker: list[ListedJob] = []
@@ -655,7 +689,7 @@ def _search_web(
         except CareerCopilotError as exc:
             if "too long" not in str(exc).casefold():
                 raise
-            break
+            continue
         judged, answered = _judge(raw, traits)
         judged.extend(_condition_gaps(opening, conditions))
         judged.extend(_language_gap(opening, conditions))
@@ -741,11 +775,13 @@ def consider_posting(
             return PasteOutcome(note=message)
     if require_grok and shutil.which("grok") is None:
         raise CareerCopilotError("Grok is not available in the terminal. Run grok login, then try again.")
-    text = readable_text(page)[:8000]
+    raw = readable_text(page)[:_FETCH_CAP]
+    text = prepare_posting(raw)
     if not text:
         raise CareerCopilotError("Paste the posting text.")
     first = next((line.lstrip("#").strip() for line in text.splitlines() if line.strip()), "")
     title = " ".join((first or "Job").split())[:120]
+    text = prepare_posting(raw, title)
     if source_link:
         link = source_link
     else:
@@ -763,8 +799,7 @@ def consider_posting(
         source="Pasted",
     )
     key = job_key(_listed(opening, 0, []))
-    if key in log.skipped_urls:
-        return PasteOutcome(note="This posting was removed from the list.")
+    removed = key in log.skipped_urls
     existing = next((job for job in log.kept + log.latest if job_key(job) == key), None)
     if existing is not None:
         return PasteOutcome(note="This posting is already on the list.", job=existing)
@@ -776,8 +811,14 @@ def consider_posting(
     judged.extend(_language_gap(opening, conditions))
     percent = match_percent(judged)
     if percent is None:
-        return PasteOutcome(note="This posting could not be scored.")
+        listed = _listed(opening, 0, [], conditions)
+        note = "This posting could not be scored."
+        if removed:
+            note = "This posting was removed from the list. " + note
+        return PasteOutcome(note=note, job=listed)
     listed = _listed(opening, percent, judged, conditions, answered=answered)
+    if removed:
+        return PasteOutcome(note="This posting was removed from the list. The match is shown here only.", job=listed)
     log.latest.append(listed)
     log.latest.sort(key=lambda job: job.match_percent, reverse=True)
     log.found_count = len(log.latest)
@@ -1018,7 +1059,7 @@ def _listed(
         url=opening.url,
         source=opening.source,
         match_percent=percent,
-        description=opening.text[:4000],
+        description=prepare_posting(opening.text, opening.title),
         covered=[point.text for point in points if point.status == "match"],
         partial=[point.text for point in points if point.status == "partial"],
         missing=[point.text for point in points if point.status == "no_match"],
@@ -1068,13 +1109,18 @@ def _opening_points(
     score: Callable[[str, str], list[MatchPoint]],
     seconds_left: int,
 ) -> list[MatchPoint]:
-    if opening.points:
-        return list(opening.points)
     token = _score_budget.set(max(1, seconds_left))
     try:
         return list(score(cv_text, _scoring_text(opening.text, roles, conditions)))
     finally:
         _score_budget.reset(token)
+
+
+def _with_posting(opening: _Opening) -> _Opening:
+    text = prepare_posting(opening.text, opening.title)
+    if text == opening.text:
+        return opening
+    return opening.model_copy(update={"text": text})
 
 
 def _web_candidate(
@@ -1097,6 +1143,8 @@ def _web_candidate(
 def _shares_cv_term(cv_text: str, posting: str, roles: list[WorkRole], skills: list[str]) -> bool:
     cv_blob = cv_text.casefold()
     post = posting.casefold()
+    cv_words = _folded_words(cv_text)
+    post_words = _folded_words(posting)
     terms = [skill.strip() for skill in skills if skill.strip()]
     terms.extend(role.name.strip() for role in roles if role.name.strip())
     for term in terms:
@@ -1105,7 +1153,27 @@ def _shares_cv_term(cv_text: str, posting: str, roles: list[WorkRole], skills: l
             continue
         if _term_in(cv_blob, folded) and _term_in(post, folded):
             return True
+        phrase = _folded_words(term)
+        if phrase and _phrase_in(phrase, cv_words) and _phrase_in(phrase, post_words):
+            return True
     return False
+
+
+def _folded_words(text: str) -> list[str]:
+    return [_fold_token(word) for word in re.findall(r"[a-z0-9+#]+", text.casefold())]
+
+
+def _fold_token(word: str) -> str:
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def _phrase_in(phrase: list[str], words: list[str]) -> bool:
+    width = len(phrase)
+    if width == 0 or width > len(words):
+        return False
+    return any(words[index : index + width] == phrase for index in range(len(words) - width + 1))
 
 
 def _term_in(blob: str, term: str) -> bool:
@@ -1393,6 +1461,49 @@ _LANGUAGE_NAMES = (
     ("French", ("french", "francais", "français", "frans", "franse")),
     ("Spanish", ("spanish", "espanol", "español", "spaans", "spaanse")),
 )
+_BODY_WORDS = (
+    (
+        "English",
+        frozenset(
+            "the and to with that this you your we our are from not can will have has if but about "
+            "which their they them for been would these those there what when where who how its into "
+            "after before during without such".split()
+        ),
+    ),
+    (
+        "Dutch",
+        frozenset(
+            "het een van voor niet zijn jouw wij naar ook bij deze wordt hebben door maar nog onze "
+            "ons waar moet worden bent kunt dat jullie wanneer hebt heb met te om op aan uit dan "
+            "wel meer tot".split()
+        ),
+    ),
+    (
+        "German",
+        frozenset(
+            "der und eine für auf ist sind nicht sich auch oder nach aus nur dass wird wurde über "
+            "zwischen durch wenn einer einem".split()
+        ),
+    ),
+    (
+        "French",
+        frozenset(
+            "le les une des pour dans qui pas sur aux avec cette sont nous vous votre notre mais "
+            "où être aussi chez donc".split()
+        ),
+    ),
+    (
+        "Portuguese",
+        frozenset(
+            "não uma para com você está são das pela pelo também porque muito ela ele essa esse "
+            "esta este isso".split()
+        ),
+    ),
+    (
+        "Spanish",
+        frozenset("los las del por sus más también cuando donde porque está son como".split()),
+    ),
+)
 _HARD_LANGUAGE = r"required|must|fluent|native|beheersing|vereist|mandatory|proficiency"
 _SOFT_LANGUAGE = r"plus|pr[eé]|preferred|advantage|nice to have"
 _SENIOR_LEVELS = ("Senior", "Director", "Executive")
@@ -1452,17 +1563,47 @@ def _languages_in(text: str) -> set[str]:
     return found
 
 
+def _language_required(sentence: str, names: tuple[str, ...]) -> bool:
+    """A language is required only when the requirement sits next to its name."""
+
+    cue = (
+        r"fluent|native|proficiency|proficient|beheersing|taal|language|"
+        r"speak(?:ing)?|spoken|vereist|required|must|mandatory"
+    )
+    for name in names:
+        token = re.escape(name)
+        pattern = rf"(?:{cue})\W+(?:\w+\W+){{0,4}}{token}|{token}\W+(?:\w+\W+){{0,4}}(?:{cue})"
+        if re.search(pattern, sentence, flags=re.IGNORECASE):
+            return True
+    return False
+
+
 def _hard_languages(text: str) -> set[str]:
     hard: set[str] = set()
     for sentence in _sentences(text):
-        if not _word(sentence, _HARD_LANGUAGE) or _word(sentence, _SOFT_LANGUAGE):
+        if _word(sentence, _SOFT_LANGUAGE):
             continue
-        hard.update(_languages_in(sentence))
+        for label, names in _LANGUAGE_NAMES:
+            if _language_required(sentence, names):
+                hard.add(label)
     return hard
 
 
 def _user_languages(text: str) -> set[str]:
     return _languages_in(text)
+
+
+def body_language(text: str) -> str:
+    """The language of a cleaned description, when one language is clearly ahead."""
+
+    words = re.findall(r"[a-zà-ÿ']+", text.casefold())
+    scores = [(label, sum(1 for word in words if word in vocab)) for label, vocab in _BODY_WORDS]
+    scores.sort(key=lambda item: item[1], reverse=True)
+    if not scores or scores[0][1] < 8:
+        return ""
+    if len(scores) > 1 and scores[0][1] < scores[1][1] * 2:
+        return ""
+    return scores[0][0]
 
 
 def _mentions_language(text: str) -> bool:
@@ -1486,6 +1627,16 @@ def _language_gap(opening: _Opening, conditions: SearchConditions) -> list[Match
     return [MatchPoint(text=f"The posting requires {named}, outside the saved languages.", status="no_match")]
 
 
+def _discovery_budget(remaining: int) -> int:
+    """Seconds for finding pages, leaving time to score the ones that open."""
+
+    if remaining <= 1:
+        return 1
+    if remaining <= _SCORE_RESERVE_SECONDS + 20:
+        return max(1, remaining // 2)
+    return remaining - _SCORE_RESERVE_SECONDS
+
+
 def _discover_with_grok(
     roles: list[WorkRole],
     conditions: SearchConditions,
@@ -1493,6 +1644,9 @@ def _discover_with_grok(
     cv_text: str = "",
     timeout_seconds: int = SEARCH_TIMEOUT_SECONDS,
     progress: Callable[[str], None] | None = None,
+    skipped: list[str] | None = None,
+    again: bool = False,
+    time_left: Callable[[], int] | None = None,
 ) -> list[_Opening]:
     if progress is not None:
         progress("Searching.")
@@ -1502,7 +1656,10 @@ def _discover_with_grok(
     with tempfile.TemporaryDirectory() as folder:
         directory = Path(folder)
         prompt_file = directory / "prompt.txt"
-        prompt_file.write_text(_search_prompt(roles, conditions, skills, cv_text), encoding="utf-8")
+        prompt_file.write_text(
+            _search_prompt(roles, conditions, skills, cv_text, skipped=skipped, again=again),
+            encoding="utf-8",
+        )
         try:
             completed = subprocess.run(
                 grok_search_argv(executable, prompt_file, directory),
@@ -1515,24 +1672,51 @@ def _discover_with_grok(
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise CareerCopilotError("Grok took too long. Nothing was saved.") from exc
-    if completed.returncode != 0:
+            late = exc.stdout or ""
+            if isinstance(late, bytes):
+                late = late.decode("utf-8", errors="replace")
+            if not late.strip():
+                raise CareerCopilotError("Grok took too long. Nothing was saved.") from exc
+            completed = subprocess.CompletedProcess(
+                grok_search_argv(executable, prompt_file, directory),
+                0,
+                stdout=late,
+                stderr="",
+            )
+    found: list[dict[str, object]] = []
+    if (completed.stdout or "").strip():
+        try:
+            found = _parse_search_jobs(completed.stdout or "")
+        except CareerCopilotError:
+            found = []
+    if completed.returncode != 0 and not found:
         raise CareerCopilotError("Grok did not return a search. Stay signed in with grok login and try again.")
+    avoided = {url for url in (skipped or []) if url.startswith("https://")}
+    if avoided:
+        found = [item for item in found if str(item.get("url", "")).strip()[:500] not in avoided]
     return openings_from_search(
-        _parse_search_jobs(completed.stdout or ""),
+        found,
         fetch_posting,
         conditions,
         progress=progress,
+        time_left=time_left,
     )
 
 
-def _search_prompt(roles: list[WorkRole], conditions: SearchConditions, skills: list[str], cv_text: str = "") -> str:
+def _search_prompt(
+    roles: list[WorkRole],
+    conditions: SearchConditions,
+    skills: list[str],
+    cv_text: str = "",
+    skipped: list[str] | None = None,
+    again: bool = False,
+) -> str:
     names = ", ".join(role.name for role in roles) or "open roles"
     lines = [
         "Search the public web for job postings that are still open.",
-        "Run several different web searches. Use the roles, the skills, and the filled fields below.",
+        "Use two web searches. Use the roles, the skills, and the filled fields below.",
+        "Open the best pages, then stop and return the JSON. Do not keep searching after that.",
         "A blank field is not a preference. Do not add a preference that is not listed.",
-        "Open the promising pages. Return only jobs whose pages you actually opened.",
         "Return only JSON:",
         '{"jobs":[{"title":"role","company":"employer","url":"https://example.com/job","requirements":[{"text":"short requirement","status":"match","basis":""}]}]}',
         "Rules:",
@@ -1547,6 +1731,12 @@ def _search_prompt(roles: list[WorkRole], conditions: SearchConditions, skills: 
         "- Leave basis empty unless status is assumed.",
         f"Roles: {names}.",
     ]
+    if again:
+        lines.append("The earlier links were already removed or could not be used. Return different open pages.")
+    removed = [url for url in (skipped or []) if url.startswith("https://")]
+    if removed:
+        lines.append("Do not return these links:")
+        lines.extend(removed[:40])
     if skills:
         lines.append("Skills: " + ", ".join(skills) + ".")
     if conditions.levels:
@@ -1570,8 +1760,7 @@ def _search_prompt(roles: list[WorkRole], conditions: SearchConditions, skills: 
         lines.append(conditions.notes.strip())
         lines.append("Use the preferences as guidance. A preference does not by itself exclude a page.")
     if cv_text.strip():
-        lines.append("CV, for the requirement status only. Do not paste it into a web query:")
-        lines.append(cv_text.strip()[:60000])
+        lines.append("Do not put the CV into the web search. The CV is judged after the pages are open.")
     return "\n".join(lines) + "\n"
 
 
@@ -1600,6 +1789,7 @@ def openings_from_search(
     fetch: Callable[[str], str],
     conditions: SearchConditions | None = None,
     progress: Callable[[str], None] | None = None,
+    time_left: Callable[[], int] | None = None,
 ) -> list[_Opening]:
     chosen = conditions or SearchConditions()
     planned: list[tuple[dict[str, object], str]] = []
@@ -1618,20 +1808,26 @@ def openings_from_search(
     openings: list[_Opening] = []
     total = len(planned)
     for index, (item, url) in enumerate(planned, start=1):
+        points = _points_from_raw(item.get("requirements"))
+        if time_left is not None and time_left() < _SCORE_RESERVE_SECONDS:
+            break
         if progress is not None:
             progress(f"Opening page {index} of {total}.")
         try:
             page = fetch(url)
         except Exception:
             continue
-        readable = readable_text(page)[:8000]
+        readable = readable_text(page)[:_FETCH_CAP]
         if len(readable) < 200:
             continue
         title = " ".join(str(item.get("title") or "").split())
         if not title:
             title = next((line.lstrip("#").strip() for line in readable.splitlines() if line.strip()), "Job")
+        cleaned = prepare_posting(readable, title)
+        if len(cleaned) < 200:
+            continue
         company = " ".join(str(item.get("company") or "").split()) or "Unknown"
-        location = _paste_location(readable, chosen)
+        location = _paste_location(cleaned, chosen)
         if not location:
             location = " ".join(str(item.get("location") or "").split())
         openings.append(
@@ -1640,11 +1836,11 @@ def openings_from_search(
                 company=company[:120],
                 url=url,
                 location=location[:200],
-                workplace=_mentioned_workplace(readable),
-                employment=_mentioned_employment(readable),
-                text=readable,
+                workplace=_mentioned_workplace(cleaned),
+                employment=_mentioned_employment(cleaned),
+                text=cleaned,
                 source="Web",
-                points=_points_from_raw(item.get("requirements")),
+                points=points,
             )
         )
     return openings
@@ -1666,7 +1862,7 @@ def _opening(
     link = str(url).strip()
     if not label or not employer or not link.startswith("https://"):
         return None
-    readable = readable_text(str(text))[:8000]
+    readable = prepare_posting(readable_text(str(text))[:_FETCH_CAP], label)
     stated = _mentioned_employment(_flatten_field(employment_field)) or _mentioned_employment(readable)
     return _Opening(
         title=label[:120],
@@ -1746,12 +1942,15 @@ def _points_from_raw(raw: object) -> list[MatchPoint]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        status = str(item.get("status", ""))
+        status = str(item.get("status", "")).strip().casefold().replace(" ", "_").replace("-", "_")
+        if status == "nomatch":
+            status = "no_match"
+        text = " ".join(str(item.get("text", "")).split())[:180]
         basis = " ".join(str(item.get("basis", "")).split())[:180]
         if status == "assumed" and not basis:
             continue
         try:
-            points.append(MatchPoint.model_validate({"text": item.get("text", ""), "status": status, "basis": basis}))
+            points.append(MatchPoint.model_validate({"text": text, "status": status, "basis": basis}))
         except ValidationError:
             continue
         if len(points) == 8:
@@ -1835,7 +2034,7 @@ def fetch_posting(url: str) -> str:
         raise
     except Exception as exc:
         raise CareerCopilotError("This page did not return the posting. Paste the text.") from exc
-    text = readable_text(raw.decode("utf-8", errors="replace"))[:8000]
+    text = readable_text(raw.decode("utf-8", errors="replace"))[:_FETCH_CAP]
     if not _posting_page_ok(text):
         raise CareerCopilotError("This page did not return the posting. Paste the text.")
     return text
@@ -1853,18 +2052,225 @@ _NOISE_LINE = (
     "accept all",
     "reject all",
 )
+_ALWAYS_CHROME = frozenset(
+    {
+        "for candidates",
+        "for employers",
+        "for members",
+        "apply now",
+        "save",
+        "view on google maps",
+        "bekijk vacatures",
+        "mijn profiel",
+        "activeer jobalerts",
+        "visit career sites",
+        "global careers site",
+        "vacatures bekijk vacatures",
+        "profiel aanmaken | inloggen",
+        "profiel aanmaken",
+        "inloggen",
+        "klik hier voor vergelijkbare vacatures",
+        "sign in",
+        "log in",
+        "create an account",
+    }
+)
+_MENU_LINES = _ALWAYS_CHROME | frozenset(
+    {
+        "academictransfer",
+        "jobs and employers",
+        "jobs",
+        "premium employers",
+        "academic employers",
+        "universities of applied sciences",
+        "career journey",
+        "orientation",
+        "matching",
+        "preparation",
+        "e-learning",
+        "events",
+        "vacatures",
+        "contact",
+        "home",
+        "about",
+        "about us",
+        "careers",
+        "technology",
+        "solution",
+        "solutions",
+        "compliance",
+        "navigation menu",
+        "blog",
+        "news",
+        "login",
+        "menu",
+        "en",
+        "nl",
+        "de",
+        "fr",
+    }
+)
+_COUNTRIES = frozenset(
+    {
+        "australia",
+        "belgium",
+        "brasil",
+        "brazil",
+        "canada",
+        "ceska republika",
+        "česká republika",
+        "danmark",
+        "denmark",
+        "deutschland",
+        "germany",
+        "estonia",
+        "espana",
+        "españa",
+        "spain",
+        "finland",
+        "france",
+        "hungary",
+        "india",
+        "italy",
+        "luxembourg",
+        "malaysia",
+        "maroc",
+        "morocco",
+        "nederland",
+        "netherlands",
+        "norge",
+        "norway",
+        "philippines",
+        "polska",
+        "poland",
+        "portugal",
+        "romania",
+        "slovensko",
+        "slovakia",
+        "sverige",
+        "sweden",
+        "united kingdom",
+        "united states",
+    }
+)
+_LANGUAGE_MENU = frozenset(
+    {
+        "english",
+        "nederlands",
+        "dutch",
+        "engels",
+        "frans",
+        "french",
+        "duits",
+        "german",
+        "portugees",
+        "portuguese",
+        "spaans",
+        "spanish",
+        "zweeds",
+        "swedish",
+        "pools",
+        "polish",
+        "tsjechisch",
+        "czech",
+        "slowaaks",
+        "slovak",
+        "noors",
+        "norwegian",
+        "deens",
+        "danish",
+        "italiano",
+        "italian",
+        "francais",
+        "français",
+        "deutsch",
+        "espanol",
+        "español",
+    }
+)
+_CONSENT_MARKERS = (
+    "trustarc",
+    "auto-block",
+    "autoblock",
+    "consent mode",
+    "before any other script",
+    "3rd-party",
+    "third-party script",
+    "core.min.js",
+    "data-ta-type",
+    "gtm-consent",
+    "notice id",
+    "gtm consent",
+)
+_LANG_CODE = re.compile(
+    r"^(?:english|nederlands|dutch|german|french|spanish|portuguese|engels|frans|duits|"
+    r"portugees|spaans|italiano)\s*\([a-z]{2}\)$"
+)
+_DAYS_REMAINING = re.compile(r"^\d+\s+days remaining$")
+_DASH_LINE = re.compile(r"^[\s\-–—_=.*|·•]+$")
+_DASH_RUN = re.compile(r"(?:\s*[-–—]){3,}")
 _SECTION_HEADING = re.compile(
     r"(?i)^(about( the (role|job|team))?|the role|requirements|responsibilities|qualifications|"
     r"what we offer|benefits|how to apply|your profile|skills|tasks|the team|who you are|"
-    r"what you.ll do|what you will do|job description)$"
+    r"what you.ll do|what you will do|job description|functiebeschrijving|functie-eisen|"
+    r"wat je gaat doen|wat wij vragen|wat wij bieden|jouw profiel|over de functie)$"
 )
-_PLACE_LABEL = re.compile(r"(?i)^(?:location|local|place|based in)\s*[:\-]?\s*(.+)$")
+_META_LINE = re.compile(
+    r"(?i)^(deadline|published|vacancy id|vacaturenummer|research fields|job types|education level|"
+    r"weekly hours|salary(?: indication)?|location|hoofdlokatie|type dienstverband|categorie|"
+    r"hours|apply by|closing date)\b"
+)
+_PLACE_LABEL = re.compile(r"(?i)^(?:location|local|place|based in|hoofdlokatie)\s*[:\-]?\s*(.+)$")
+
+
+def prepare_posting(text: str, title: str = "") -> str:
+    """The job text without the site menu, cut on a line before the cap."""
+
+    cleaned = strip_page_chrome(text, title).strip()
+    if len(cleaned) <= _POSTING_CAP:
+        return cleaned
+    cut = cleaned.rfind("\n", 0, _POSTING_CAP)
+    if cut < _POSTING_CAP // 2:
+        cut = cleaned.rfind(" ", 0, _POSTING_CAP)
+    if cut < _POSTING_CAP // 2:
+        cut = _POSTING_CAP
+    return cleaned[:cut].strip()
+
+
+def strip_page_chrome(text: str, title: str = "") -> str:
+    """Drop navigation, consent comments, and dash runs. Keep the description."""
+
+    source = [_tidy_line(line) for line in readable_text(text).splitlines()]
+    drop: set[int] = set()
+    for index, line in enumerate(source):
+        if line and _always_chrome(line):
+            drop.add(index)
+    run: list[int] = []
+
+    def flush() -> None:
+        chosen = [index for index in run if source[index] and _menu_item(source[index])]
+        if len(chosen) >= 4:
+            drop.update(chosen)
+        run.clear()
+
+    for index, line in enumerate(source):
+        if not line or _menu_item(line) or _always_chrome(line):
+            run.append(index)
+            continue
+        flush()
+    flush()
+    kept = [line for index, line in enumerate(source) if line and index not in drop]
+    kept = _drop_repeated_short_runs(kept)
+    if title:
+        kept = _drop_banners(kept, title)
+    kept = _drop_topic_catalog(kept, title)
+    return "\n".join(kept).strip()
 
 
 def cleaned_posting(text: str, title: str = "") -> str:
     """A short posting for the page. Blank lines and site chrome are left out."""
 
-    lines = [line.strip() for line in readable_text(text).splitlines() if line.strip() and not _noise_line(line)]
+    lines = [line.strip() for line in strip_page_chrome(text, title).splitlines() if line.strip()]
     if title and lines and lines[0].lstrip("#").strip().casefold() == title.casefold():
         lines = lines[1:]
     blocks: list[str] = []
@@ -1881,6 +2287,10 @@ def cleaned_posting(text: str, title: str = "") -> str:
             flush()
             blocks.append(f"**{plain}**")
             continue
+        if _META_LINE.match(plain):
+            flush()
+            blocks.append(plain)
+            continue
         if line.startswith(("- ", "* ")):
             flush()
             blocks.append(line if line.startswith("- ") else f"- {line[2:].strip()}")
@@ -1891,29 +2301,265 @@ def cleaned_posting(text: str, title: str = "") -> str:
 
 
 def posting_place(text: str) -> str:
-    for line in [item.strip() for item in readable_text(text).splitlines() if item.strip()]:
+    for line in [item.strip() for item in strip_page_chrome(text).splitlines() if item.strip()]:
         labeled = _PLACE_LABEL.match(line.lstrip("#").strip())
         if labeled:
             return labeled.group(1)[:80]
-    for line in [item.strip() for item in readable_text(text).splitlines() if item.strip()]:
+    for line in [item.strip() for item in strip_page_chrome(text).splitlines() if item.strip()]:
         if len(line) <= 60 and any(_has_place(line, city) for city in _NL_CITIES):
             return line[:80]
     return ""
 
 
 def posting_workplace(text: str) -> str:
-    return _mentioned_workplace(text)
+    return _mentioned_workplace(strip_page_chrome(text))
 
 
-def _noise_line(line: str) -> bool:
-    blob = line.casefold()
-    if len(blob) > 80:
+def _tidy_line(line: str) -> str:
+    cleaned = re.sub(r"(?i)\s*view on google maps\s*$", "", _DASH_RUN.sub(" ", line))
+    cleaned = re.sub(r"(?i)\s*what are you searching for\??\s*search\b", " ", cleaned)
+    cleaned = re.sub(r"(?i)\s*geselecteerde taal:\s*\w+", " ", cleaned)
+    return " ".join(cleaned.split())
+
+
+def _button_glue(line: str) -> bool:
+    folded = re.sub(r"\d+\s*days remaining", " ", line.casefold())
+    folded = folded.replace("apply now", " ").replace("view on google maps", " ")
+    folded = re.sub(r"\bsave\b", " ", folded)
+    return not folded.strip(" -|")
+
+
+def _bare(line: str) -> str:
+    stripped = re.sub(r"^(?:[-*•]\s+)+", "", line.strip())
+    return stripped.lstrip("#").strip()
+
+
+def _always_chrome(line: str) -> bool:
+    folded = line.casefold().strip()
+    bare = _bare(line).casefold().strip()
+    if not folded or _DASH_LINE.match(folded) or _button_glue(folded):
+        return True
+    if bare in _ALWAYS_CHROME or bare.endswith(" logo"):
+        return True
+    if bare.startswith("-->") or bare in {"terug", "back", "search", "directly to"}:
+        return True
+    if bare.startswith("go to ") and len(bare) <= 80 and not bare.endswith((".", "!", "?")):
+        return True
+    if "what are you searching for" in bare and len(bare) <= 90 and "." not in bare:
+        return True
+    if _doubled_label(bare):
+        return True
+    if _DAYS_REMAINING.match(bare) or _LANG_CODE.match(bare):
+        return True
+    if re.match(r"^careers\s*[|\-–—]\s*\S", bare) and len(bare) <= 40:
+        return True
+    if _nav_glue(bare):
+        return True
+    if any(marker in bare for marker in _CONSENT_MARKERS):
+        return True
+    if len(bare) <= 120 and ("skip navigation" in bare or "back to navigation" in bare):
+        return True
+    if len(bare) <= 80 and any(phrase in bare for phrase in _NOISE_LINE):
+        return True
+    return False
+
+
+_NAV_TOKENS = frozenset(
+    {
+        "home",
+        "about",
+        "us",
+        "careers",
+        "contact",
+        "technology",
+        "solution",
+        "solutions",
+        "compliance",
+        "navigation",
+        "menu",
+        "blog",
+        "news",
+        "login",
+    }
+)
+
+
+def _nav_glue(line: str) -> bool:
+    folded = line.casefold()
+    if "navigation menu" in folded and len(folded) <= 80:
+        return True
+    tokens = folded.split()
+    return len(tokens) >= 2 and all(token in _NAV_TOKENS for token in tokens)
+
+
+def _doubled_label(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or len(stripped) > 120 or stripped.endswith((".", "!", "?")) or ". " in stripped:
         return False
-    return any(phrase in blob for phrase in _NOISE_LINE)
+    folded = re.sub(r"\s+", "", stripped.casefold())
+    if len(folded) < 8 or len(folded) % 2:
+        return False
+    half = len(folded) // 2
+    return folded[:half] == folded[half:]
+
+
+def _sentence_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("- ", "* ")):
+        return False
+    if len(stripped) >= 80 and stripped.endswith((".", "!", "?")):
+        return True
+    return len(stripped.split()) >= 14 and "." in stripped
+
+
+def _catalog_line(line: str, title: str) -> bool:
+    bare = _bare(line).rstrip(":")
+    if not bare:
+        return False
+    if _META_LINE.match(bare):
+        return False
+    if title and bare.casefold() == " ".join(title.split()).casefold():
+        return False
+    if ". " in bare or bare.endswith((".", "!")):
+        return False
+    if bare.endswith("?") and not line.strip().startswith(("- ", "* ")):
+        return False
+    return len(bare.split()) <= 12 and len(bare) <= 110
+
+
+def _menu_heading(line: str) -> bool:
+    plain = _bare(line).rstrip(":")
+    return bool(_SECTION_HEADING.match(plain)) and len(plain.split()) <= 4
+
+
+def _vacancy_start(lines: list[str], title: str) -> int | None:
+    name = " ".join(title.split()).casefold()
+    for index, line in enumerate(lines):
+        if name and len(name) >= 8 and line.casefold().startswith(name) and line.casefold() != name:
+            return index
+        if _sentence_line(line):
+            return index
+    for index, line in enumerate(lines):
+        plain = _bare(line).rstrip(":")
+        if not _SECTION_HEADING.match(plain):
+            continue
+        following = lines[index + 1 : index + 5]
+        if sum(1 for item in following if _catalog_line(item, title)) >= 3:
+            continue
+        return index
+    for index, line in enumerate(lines):
+        if _SECTION_HEADING.match(_bare(line).rstrip(":")):
+            return index
+    return None
+
+
+def _drop_topic_catalog(lines: list[str], title: str) -> list[str]:
+    """Drop a long topic menu that sits above the vacancy."""
+
+    start = _vacancy_start(lines, title)
+    if start is None:
+        return lines
+    drop: set[int] = set()
+    run: list[int] = []
+
+    def flush() -> None:
+        if len(run) >= 8:
+            drop.update(run)
+        run.clear()
+
+    for index, line in enumerate(lines[:start]):
+        if _catalog_line(line, title) or _menu_heading(line):
+            run.append(index)
+            continue
+        flush()
+    flush()
+    return [line for index, line in enumerate(lines) if index not in drop]
+
+
+def _plain_short_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith(("- ", "* ")):
+        return False
+    plain = stripped.lstrip("#").rstrip(":")
+    if _META_LINE.match(plain) or _SECTION_HEADING.match(plain):
+        return False
+    if len(stripped) > 40:
+        return False
+    return 1 <= len(stripped.split()) <= 3
+
+
+def _repeated_width(texts: list[str]) -> int:
+    size = len(texts)
+    for width in range(4, size // 2 + 1):
+        block = texts[:width]
+        count = 1
+        while width * (count + 1) <= size and texts[width * count : width * (count + 1)] == block:
+            count += 1
+        if count >= 2:
+            return width * count
+    return 0
+
+
+def _drop_repeated_short_runs(lines: list[str]) -> list[str]:
+    """A block of short lines that appears twice is a site menu."""
+
+    drop: set[int] = set()
+    runs: list[tuple[tuple[str, ...], list[int]]] = []
+    index = 0
+    while index < len(lines):
+        if not _plain_short_line(lines[index]):
+            index += 1
+            continue
+        texts: list[str] = []
+        positions: list[int] = []
+        while index < len(lines) and _plain_short_line(lines[index]):
+            texts.append(lines[index].casefold())
+            positions.append(index)
+            index += 1
+        repeated = _repeated_width(texts)
+        if repeated:
+            drop.update(positions[:repeated])
+            continue
+        if len(texts) >= 4:
+            runs.append((tuple(texts), positions))
+    counts: dict[tuple[str, ...], int] = {}
+    for signature, _positions in runs:
+        counts[signature] = counts.get(signature, 0) + 1
+    for signature, positions in runs:
+        if counts[signature] >= 2:
+            drop.update(positions)
+    return [line for index, line in enumerate(lines) if index not in drop]
+
+
+def _menu_item(line: str) -> bool:
+    folded = _bare(line).casefold().strip()
+    if folded in _MENU_LINES or folded in _COUNTRIES or folded in _LANGUAGE_MENU:
+        return True
+    return bool(_LANG_CODE.match(folded) or folded.endswith(" logo"))
+
+
+def _drop_banners(lines: list[str], title: str) -> list[str]:
+    name = " ".join(title.split()).casefold()
+    if len(name) < 8:
+        return lines
+    kept: list[str] = []
+    for index, line in enumerate(lines):
+        folded = line.casefold()
+        later = lines[index + 1 :]
+        if (
+            folded.startswith(name)
+            and folded != name
+            and ("—" in line or "|" in line or " - " in line)
+            and any(item.casefold().startswith(name) for item in later)
+        ):
+            continue
+        kept.append(line)
+    return kept
 
 
 def readable_text(value: str) -> str:
     text = html.unescape(html.unescape(value or ""))
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
     text = re.sub(r"(?i)<\s*(script|style)\b[^>]*>.*?</\s*\1\s*>", " ", text, flags=re.DOTALL)
     text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", text)
     text = re.sub(r"(?i)<\s*li[^>]*>", "\n- ", text)

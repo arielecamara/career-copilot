@@ -266,7 +266,7 @@ def grok_search_argv(executable: str, prompt_file: Path, cwd: Path) -> list[str]
         "--output-format",
         "json",
         "--max-turns",
-        "8",
+        "3",
         "--cwd",
         str(cwd),
         "--no-auto-update",

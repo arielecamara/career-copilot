@@ -1057,7 +1057,7 @@ def test_web_discovery_rescores_opened_pages_and_skips_a_dead_link(tmp_path: Pat
     assert fetched == ["https://example.com/jobs/one", "https://example.com/jobs/dead"]
     prompt = _search_prompt(_roles(), clean_conditions([], [], [], "", ""), ["Neo4j"])
     assert "Neo4j" in prompt
-    assert "several different web searches" in prompt
+    assert "Use two web searches." in prompt
     assert "at most 4" not in prompt
     assert "A blank field is not a preference" in prompt
     assert "SECRET" not in prompt
@@ -1141,7 +1141,7 @@ def test_notes_guide_the_search_and_do_not_add_a_hard_gap(tmp_path: Path):
     assert "The posting does not mention a language." in quiet.job.notes
     prompt = _search_prompt(_roles(), noted, ["Neo4j"])
     assert "at most 4" not in prompt
-    assert "several different web searches" in prompt
+    assert "Use two web searches." in prompt
     assert "Light programming only." in prompt
     assert "A preference does not by itself exclude a page." in prompt
     assert "Prefer light programming" not in prompt
@@ -1411,6 +1411,347 @@ def test_the_posting_view_drops_blank_lines_and_site_chrome():
     assert notes_for_display([DEADLINE_NOTE, "Kept"], "Deadline\n15 Nov '26") == ["Kept"]
 
 
+def test_page_chrome_is_left_out_and_the_description_is_kept():
+    from career_copilot.job_list import prepare_posting
+
+    academic = "\n".join(
+        [
+            "Postdoc on Geodata Science and GeoAI — Utrecht University — AcademicTransfer - - - - -",
+            "For candidates",
+            "For employers",
+            "For members",
+            "AcademicTransfer",
+            "Jobs and employers",
+            "Premium employers",
+            "English (EN)",
+            "Nederlands (NL)",
+            "X Logo",
+            "Facebook Logo",
+            "Postdoc on Geodata Science and GeoAI Apply spatial analytics and GeoAI approaches to improve human health.",
+            "Deadline",
+            "15 Nov '26",
+            "Published 29 Sep '26",
+            "Vacancy ID 5736",
+            "Apply now25 days remaining Save",
+            "Research fields Geography",
+            "Weekly hours 36-40 hours per week",
+            "Salary indication €3706-€5760 per month",
+            "Location Princetonlaan 8a, 3584CB, Utrecht",
+            "View on Google Maps",
+            "Job description",
+            "The researcher will build spatial tools for the team and with the lab.",
+        ]
+    )
+    view = cleaned_posting(academic, title="Postdoc on Geodata Science and GeoAI")
+    assert "For candidates" not in view
+    assert "AcademicTransfer" not in view
+    assert "X Logo" not in view
+    assert "Apply now" not in view
+    assert "Google Maps" not in view
+    assert "- - -" not in view
+    assert "Deadline" in view
+    assert "15 Nov '26" in view
+    assert "Vacancy ID 5736" in view
+    assert "Salary indication" in view
+    assert "Princetonlaan" in view
+    assert "**Job description**" in view
+    assert "spatial tools" in view
+    cgi_menu = "\n".join(
+        [
+            "--> , before ANY other script. TrustArc auto-block core.min.js Notice ID: c1yyug",
+            "Careers | CGI.com",
+            "Bekijk vacatures",
+            "Mijn profiel",
+            "Activeer jobalerts",
+            "Australia",
+            "Belgium",
+            "Brasil",
+            "Canada",
+            "France",
+            "Nederlands",
+            "Engels",
+            "Frans",
+            "Duits",
+            "Vacatures Bekijk vacatures",
+            "Profiel aanmaken | Inloggen",
+        ]
+    )
+    cgi_body = (
+        "Senior Linked Data & Knowledge Graph Engineer - High Tech\n"
+        "Hoofdlokatie Nederland, Eindhoven\n"
+        "Vacaturenummer J1026-1094\n"
+        "Functiebeschrijving\n"
+        "Is het jouw passie om complexe data slim met elkaar te verbinden? "
+        "Je werkt aan Knowledge Graphs en Neo4j voor het team in Eindhoven. "
+        "Een afgeronde opleiding met een sterke achtergrond wordt gevraagd.\n"
+    )
+    padding = "\n".join(["Australia", "Belgium", "Canada", "France", "Germany"] * 500)
+    stored = prepare_posting(f"{cgi_menu}\n{padding}\n{cgi_body}", "Senior Linked Data & Knowledge Graph Engineer")
+    assert "TrustArc" not in stored
+    assert "Bekijk vacatures" not in stored
+    assert "Australia" not in stored
+    assert "Functiebeschrijving" in stored
+    assert "J1026-1094" in stored
+    assert "Eindhoven" in stored
+    assert len(stored) <= 8000
+    assert not stored.endswith("ee")
+
+
+def test_a_repeated_menu_and_a_site_title_stay_out_of_the_posting():
+    luo = "\n".join(
+        [
+            "Careers – Luo",
+            "Home",
+            "Technology",
+            "Solution",
+            "Compliance",
+            "About Us",
+            "Careers",
+            "Contact Contact Navigation Menu Navigation Menu",
+            "Home",
+            "Technology",
+            "Solution",
+            "Compliance",
+            "About Us",
+            "Careers",
+            "Spatial Data Engineer",
+            "The researcher will build Neo4j tools for the team and with the lab.",
+            "Requirements",
+            "- Python",
+            "- SQL",
+            "What we offer",
+            "- A pension",
+            "Location: Utrecht",
+        ]
+    )
+    view = cleaned_posting(luo, title="Spatial Data Engineer")
+    assert "Home" not in view
+    assert "Technology" not in view
+    assert "About Us" not in view
+    assert "Navigation Menu" not in view
+    assert "Luo" not in view
+    assert "Neo4j" in view
+    assert "- Python" in view
+    assert "pension" in view
+    assert "Utrecht" in view
+    repeated = "\n".join(
+        [
+            "Alpha",
+            "Bravo",
+            "Charlie",
+            "Delta",
+            "Alpha",
+            "Bravo",
+            "Charlie",
+            "Delta",
+            "The researcher will build Neo4j tools for the team and with the lab.",
+            "- Python",
+        ]
+    )
+    hidden = cleaned_posting(repeated, title="Spatial Data Engineer")
+    assert "Alpha" not in hidden
+    assert "Neo4j" in hidden
+    assert "- Python" in hidden
+    once = "\n".join(
+        [
+            "Alpha",
+            "Bravo",
+            "Charlie",
+            "Delta",
+            "The researcher will build Neo4j tools for the team and with the lab.",
+        ]
+    )
+    kept = cleaned_posting(once, title="Spatial Data Engineer")
+    assert "Alpha" in kept
+    assert "Neo4j" in kept
+
+
+def test_a_topic_menu_above_the_vacancy_stays_out_of_the_posting():
+    page = "\n".join(
+        [
+            "Vacancy Expert Synthetic Aperture Radar at TNO in Den Haag What are you searching for?Search Geselecteerde taal: EN",
+            "English",
+            "Nederlands",
+            "Sustainable",
+            "Circular and industrial constructionCircular and industrial construction",
+            "terug",
+            "Biobased building materials",
+            "Industrial and conceptual construction",
+            "Safety of buildings",
+            "Safe efficient care building",
+            "Go to Circular and industrial construction",
+            "Earth observation",
+            "Energy in the built environmentEnergy in the built environment",
+            "terug",
+            "Climate adaptation",
+            "Healthy living",
+            "Go to Earth observation",
+            "Mobility",
+            "Smart industry",
+            "The researcher will build synthetic aperture radar tools for the team and with the lab.",
+            "What we offer",
+            "- A pension",
+            "Location: Den Haag",
+        ]
+    )
+    view = cleaned_posting(page, title="Expert Synthetic Aperture Radar")
+    assert "What are you searching for" not in view
+    assert "Geselecteerde" not in view
+    assert "Biobased building materials" not in view
+    assert "Earth observation" not in view
+    assert "terug" not in view
+    assert "Go to " not in view
+    assert "Circular and industrial construction" not in view
+    assert "English" not in view
+    assert "Nederlands" not in view
+    assert "synthetic aperture radar tools" in view
+    assert "What we offer" in view
+    assert "- A pension" in view
+    assert "Den Haag" in view
+
+
+def test_a_bullet_topic_menu_does_not_push_the_vacancy_past_the_cap():
+    from career_copilot.job_list import prepare_posting
+
+    topics = [f"- Circular topic area number {index:03d}" for index in range(500)]
+    page = "\n".join(
+        [
+            "Vacancy Expert Synthetic Aperture Radar at TNO in Den Haag",
+            *topics,
+            "Skip navigation (subjects beneath theme Careers)",
+            "Directly to",
+            "- Vacancies",
+            "- Working at TNO",
+            "As a SAR expert at TNO you truly work in the frontline of airborne and spaceborne radar technology.",
+            "Requirements",
+            "- Python",
+            "- A pension",
+            "Location: Den Haag",
+        ]
+    )
+    assert len(page) > 8000
+    stored = prepare_posting(page, "Expert Synthetic Aperture Radar")
+    assert "Topic area" not in stored
+    assert "Skip navigation" not in stored
+    assert "Directly to" not in stored
+    assert "Working at TNO" not in stored
+    assert "frontline of airborne" in stored
+    assert "- Python" in stored
+    assert "- A pension" in stored
+    assert "Den Haag" in stored
+    short = "\n".join(
+        [
+            "- Alpha",
+            "- Bravo",
+            "- Charlie",
+            "- Delta",
+            "The researcher will build Neo4j tools for the team and with the lab.",
+        ]
+    )
+    kept = cleaned_posting(short, title="Spatial Data Engineer")
+    assert "Alpha" in kept
+    assert "Neo4j" in kept
+
+
+def test_a_dutch_institution_is_not_a_required_language():
+    from career_copilot.job_list import _hard_languages, fits_language
+
+    certificate = (
+        "As you will be working for clients in the domain of defence and security, "
+        "a Certificate of No Objection issued by AIVD (the Dutch General Intelligence and Security Service) is mandatory."
+    )
+    english = (
+        "The researcher will build Neo4j tools for the team and with the lab. "
+        "This role is for someone who can explain the model. We have the data and the graph. "
+        "They will work with our group after the start. The team can share the work when the project needs it."
+    )
+    assert _hard_languages(certificate) == set()
+    english_only = clean_conditions([], [], ["Remote"], "", "", languages="English")
+    assert fits_language(f"{english}\n{certificate}", english_only)
+    assert not fits_language(english + " Fluent Dutch is required.", english_only)
+    assert _hard_languages("Uitstekende beheersing van de Engelse taal; Nederlands is een pré.") == {"English"}
+
+
+def test_a_dutch_description_stays_out_when_only_english_is_saved(tmp_path: Path):
+    from career_copilot.job_list import body_language, fits_language
+
+    dutch = (
+        "Is het jouw passie om complexe data slim met elkaar te verbinden en innovatieve oplossingen te bouwen? "
+        "Als researcher versterk je onze unit op de campus. Jouw rol in ons team ontwerp je met Neo4j. "
+        "Je werkt aan Knowledge Graphs en denkt mee over de architectuur. "
+        "Je hebt ervaring met graph-technologie. Vanuit jouw ervaring ben je in staat om concepten te maken. "
+        "Je kijkt verder dan alleen de techniek en kunt onderwerpen uitleggen voor stakeholders. "
+        "Binnen onze unit werk je samen aan oplossingen. Je bent een ervaren specialist."
+    )
+    english = (
+        "The researcher will build Neo4j tools for the team and with the lab. "
+        "This role is for someone who can explain the model. We have the data and the graph. "
+        "They will work with our group after the start. The team can share the work when the project needs it."
+    )
+    menu = "\n".join(
+        [
+            "For candidates",
+            "For employers",
+            "Nederlands",
+            "Engels",
+            "Frans",
+            "Duits",
+            "Australia",
+            "Belgium",
+            "Canada",
+            "France",
+            "English (EN)",
+            "Nederlands (NL)",
+        ]
+    )
+    assert body_language(dutch) == "Dutch"
+    assert body_language(f"{menu}\n{english}") == "English"
+    english_only = clean_conditions([], [], ["Remote"], "", "", languages="English")
+    both = clean_conditions([], [], ["Remote"], "", "", languages="English, Dutch")
+    assert not fits_language(dutch, english_only)
+    assert fits_language(dutch, both)
+    assert fits_language(f"{menu}\n{english}", english_only)
+    plus = english + " Dutch is a plus."
+    assert fits_language(plus, english_only)
+    required = english + " Fluent Dutch is required."
+    assert not fits_language(required, english_only)
+    dutch_job = _web_opening("https://example.com/jobs/cgi", dutch, title="Onderzoeker", workplace="Remote")
+    english_job = _web_opening(
+        "https://example.com/jobs/geo",
+        f"{menu}\n{english}\nDeadline\n15 Nov '26",
+        title="Knowledge Graph Engineer",
+        workplace="Remote",
+    )
+    hidden = real_search(
+        "Neo4j researcher",
+        _roles(),
+        english_only,
+        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        discover=lambda: [dutch_job, english_job],
+        skills=["Neo4j"],
+        path=tmp_path / "english.json",
+        require_grok=False,
+        today=date(2026, 10, 21),
+    )
+    assert [job.url for job in hidden.latest] == ["https://example.com/jobs/geo"]
+    assert "For candidates" not in hidden.latest[0].description
+    assert "Australia" not in hidden.latest[0].description
+    assert "Neo4j" in hidden.latest[0].description
+    assert deadline_on(hidden.latest[0].description) == date(2026, 11, 15)
+    shown = real_search(
+        "Neo4j researcher",
+        _roles(),
+        both,
+        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        discover=lambda: [dutch_job],
+        skills=["Neo4j"],
+        path=tmp_path / "both.json",
+        require_grok=False,
+        today=date(2026, 10, 21),
+    )
+    assert [job.url for job in shown.latest] == ["https://example.com/jobs/cgi"]
+
+
 def test_a_yes_on_a_possible_match_counts_on_the_next_search(tmp_path: Path):
     def score(_cv: str, _posting: str) -> list[MatchPoint]:
         return [
@@ -1644,3 +1985,256 @@ def test_yes_on_the_job_page_moves_the_line_into_what_matches(tmp_path: Path, mo
     traits = (tmp_path / ".career-copilot" / "traits.json").read_text(encoding="utf-8")
     assert "Related research" in traits
     assert '"vote": "up"' in traits
+
+
+def _manual_result() -> ListedJob:
+    return ListedJob(
+        title="Researcher",
+        company="Pasted",
+        url="https://example.com/jobs/manual?id=1",
+        source="Pasted",
+        match_percent=50,
+        description="Remote research.",
+        covered=["Research"],
+        partial=["Related research"],
+        missing=["A license"],
+    )
+
+
+def _open_manual_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, job: ListedJob):
+    pytest.importorskip("streamlit")
+    from streamlit.testing.v1 import AppTest
+
+    from career_copilot.job_list import PasteOutcome
+
+    monkeypatch.setenv("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    monkeypatch.chdir(tmp_path)
+    save_roles(tmp_path / ".career-copilot" / "roles.json", _roles())
+    save_search(_remote(), tmp_path / ".career-copilot" / "search.json")
+
+    def consider(*_args, **_kwargs):
+        return PasteOutcome(job=job)
+
+    monkeypatch.setattr("career_copilot.job_list.consider_posting", consider)
+    monkeypatch.setattr("career_copilot.ui_app.consider_posting", consider)
+    script = Path(__file__).parents[1] / "src" / "career_copilot" / "ui_app.py"
+    app = AppTest.from_file(str(script), default_timeout=60)
+    app.run()
+    app.sidebar.radio[0].set_value("Jobs").run()
+    next(item for item in app.button if item.label == "Manual search").click().run()
+    next(item for item in app.button if item.label == "Match analysis").click().run()
+    assert not app.exception, app.exception
+    return app
+
+
+def _visible_text(app) -> str:
+    return "\n".join(
+        str(item.value) for item in list(app.markdown) + list(app.caption) + list(app.subheader)
+    )
+
+
+def test_yes_on_a_manual_result_moves_the_line_and_saves_the_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app = _open_manual_result(tmp_path, monkeypatch, _manual_result())
+    assert "Possible matches" in _visible_text(app)
+    next(item for item in app.button if item.label == "Yes").click().run()
+    assert not app.exception, app.exception
+    visible = _visible_text(app)
+    assert "Possible matches" not in visible
+    assert "Related research" in visible
+    assert "Match: 67%" in visible
+    traits = (tmp_path / ".career-copilot" / "traits.json").read_text(encoding="utf-8")
+    assert "Related research" in traits
+    assert '"vote": "up"' in traits
+    assert load_log(tmp_path / ".career-copilot" / "jobs.json").latest == []
+
+
+def test_no_on_a_manual_result_moves_the_line_into_what_is_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app = _open_manual_result(tmp_path, monkeypatch, _manual_result())
+    next(item for item in app.button if item.label == "No").click().run()
+    assert not app.exception, app.exception
+    visible = _visible_text(app)
+    assert "Possible matches" not in visible
+    assert "Related research" in visible
+    assert "Match: 33%" in visible
+    traits = (tmp_path / ".career-copilot" / "traits.json").read_text(encoding="utf-8")
+    assert '"vote": "down"' in traits
+
+
+def test_a_slow_score_does_not_drop_the_next_page(tmp_path: Path):
+    calls: list[str] = []
+
+    def score(_cv: str, posting: str) -> list[MatchPoint]:
+        calls.append(posting)
+        if len(calls) == 1:
+            raise CareerCopilotError("Grok took too long. Nothing was saved.")
+        return [MatchPoint(text="Neo4j", status="match")]
+
+    pages = [
+        _web_opening("https://example.com/jobs/slow", "Remote Neo4j researcher role. " * 8, workplace="Remote"),
+        _web_opening("https://example.com/jobs/next", "Remote Neo4j researcher role. " * 8, workplace="Remote"),
+    ]
+    outcome = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=score,
+        discover=lambda: pages,
+        skills=["Neo4j"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    assert len(calls) == 2
+    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/next"]
+
+
+def test_a_guessed_search_requirement_is_scored_again(tmp_path: Path):
+    page = _web_opening(
+        "https://example.com/jobs/plain",
+        "Remote Neo4j researcher role. " * 8,
+        workplace="Remote",
+    ).model_copy(update={"points": [MatchPoint(text="Neo4j", status="match")]})
+    calls: list[str] = []
+
+    def score(_cv: str, _posting: str) -> list[MatchPoint]:
+        calls.append("scored")
+        return [MatchPoint(text="Python", status="match")]
+
+    outcome = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=score,
+        discover=lambda: [page],
+        skills=["Neo4j"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    assert calls == ["scored"]
+    assert outcome.latest[0].covered == ["Python"]
+
+
+def test_a_long_search_requirement_is_kept():
+    from career_copilot.job_list import _points_from_raw
+
+    text = "Neo4j " + ("graph " * 80)
+    points = _points_from_raw([{"text": text, "status": "Match", "basis": "x" * 300}])
+    assert len(text) > 180
+    assert len(points) == 1
+    assert points[0].status == "match"
+    assert 100 < len(points[0].text) <= 180
+    assert len(points[0].basis) == 180
+    assert points[0].text.startswith("Neo4j")
+
+
+def test_a_plural_skill_still_opens_the_page(tmp_path: Path):
+    page = _web_opening(
+        "https://example.com/jobs/graph",
+        "Remote role building a knowledge graph for the team. " * 8,
+        title="Engineer",
+        workplace="Remote",
+    )
+    outcome = real_search(
+        "Built Knowledge Graphs for collections.",
+        [WorkRole(name="cartographer", reason="Maps.")],
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: [MatchPoint(text="Knowledge Graphs", status="match")],
+        discover=lambda: [page],
+        skills=["Knowledge Graphs"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/graph"]
+
+
+def test_removed_links_are_left_out_and_the_search_asks_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from career_copilot.job_list import _discovery_budget, _search_prompt
+
+    assert _discovery_budget(240) == 200
+    assert _discovery_budget(50) == 25
+    assert _discovery_budget(1) == 1
+    prompt = _search_prompt(
+        _roles(),
+        clean_conditions([], [], [], "", ""),
+        ["Neo4j"],
+        skipped=["https://example.com/jobs/old", "paste:secret:pasted"],
+        again=True,
+    )
+    assert "https://example.com/jobs/old" in prompt
+    assert "paste:secret" not in prompt
+    hidden = _search_prompt(_roles(), clean_conditions([], [], [], "", ""), ["Neo4j"], "SECRET CURRICULUM line")
+    assert "SECRET CURRICULUM" not in hidden
+    assert "Do not put the CV into the web search." in hidden
+    assert "Do not return these links:" in prompt
+    assert "Return different open pages." in prompt
+    old = _web_opening("https://example.com/jobs/old", "Remote Neo4j researcher role. " * 8, workplace="Remote")
+    new = _web_opening("https://example.com/jobs/new", "Remote Neo4j researcher role. " * 8, workplace="Remote")
+    calls: list[bool] = []
+
+    def fake(*_args, **kwargs):
+        calls.append(bool(kwargs.get("again")))
+        return [old] if not kwargs.get("again") else [new]
+
+    monkeypatch.setattr("career_copilot.job_list._discover_with_grok", fake)
+    path = tmp_path / "jobs.json"
+    save_log(SearchLog(skipped_urls=["https://example.com/jobs/old"]), path)
+    outcome = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        skills=["Neo4j"],
+        path=path,
+        require_grok=False,
+    )
+    assert calls == [False, True]
+    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new"]
+    assert outcome.skipped_urls == ["https://example.com/jobs/old"]
+
+
+def test_a_search_that_does_not_answer_is_tried_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = _web_opening("https://example.com/jobs/new", "Remote Neo4j researcher role. " * 8, workplace="Remote")
+    calls: list[bool] = []
+
+    def fake(*_args, **kwargs):
+        calls.append(bool(kwargs.get("again")))
+        if not kwargs.get("again"):
+            raise CareerCopilotError(
+                "Grok did not return a search. Stay signed in with grok login and try again."
+            )
+        return [page]
+
+    monkeypatch.setattr("career_copilot.job_list._discover_with_grok", fake)
+    outcome = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        skills=["Neo4j"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    assert calls == [False, True]
+    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new"]
+
+
+def test_opening_pages_stops_when_the_score_needs_the_remaining_time():
+    from career_copilot.job_list import openings_from_search
+
+    fetched: list[str] = []
+
+    def fetch(url: str) -> str:
+        fetched.append(url)
+        return "Remote Neo4j researcher role in Utrecht. " * 8
+
+    items = [
+        {"title": "Needs a score", "company": "Lab", "url": "https://example.com/jobs/slow"},
+        {
+            "title": "Researcher",
+            "company": "Lab",
+            "url": "https://example.com/jobs/ready",
+            "requirements": [{"text": "Neo4j", "status": "match"}],
+        },
+    ]
+    opened = openings_from_search(items, fetch, time_left=lambda: 10)
+    assert fetched == []
+    assert opened == []

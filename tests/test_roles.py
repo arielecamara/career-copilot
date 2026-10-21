@@ -80,7 +80,7 @@ def test_child_env_and_argv_do_not_carry_a_key():
     assert argv[argv.index("--max-turns") + 1] == "1"
     assert "web_search" in argv[argv.index("--disallowed-tools") + 1]
     search = grok_search_argv("grok", Path("prompt.txt"), Path("."))
-    assert search[search.index("--max-turns") + 1] == "8"
+    assert search[search.index("--max-turns") + 1] == "3"
     assert "web_search" not in search[search.index("--disallowed-tools") + 1]
     assert "web_fetch" not in search[search.index("--disallowed-tools") + 1]
 

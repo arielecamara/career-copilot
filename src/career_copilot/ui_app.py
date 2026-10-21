@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from career_copilot.applications import load_applications, remember_cv, set_applied
 from career_copilot.cli import _format_analysis
 from career_copilot.errors import CareerCopilotError
 from career_copilot.inputs import (
@@ -43,6 +44,7 @@ from career_copilot.job_list import (
     load_log,
     notes_for_display,
     record_answer,
+    revise_job,
     apply_saved_traits,
     posting_place,
     posting_workplace,
@@ -172,13 +174,78 @@ def _main(st) -> None:
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
     _prepare_session(st)
-    page = st.sidebar.radio("Page", ["User", "Search", "Jobs"], key="page")
+    page = st.sidebar.radio("Page", ["User", "Search", "Jobs", "Documents"], key="page")
     if page == "Search":
         _page_search(st)
     elif page == "Jobs":
         _page_jobs(st)
+    elif page == "Documents":
+        _page_written(st)
     else:
         _page_user(st)
+
+
+def _page_written(st) -> None:
+    st.header("Documents")
+    records = load_applications()
+    if not records:
+        st.caption("No CV has been written yet.")
+        return
+    for record in records:
+        _written_row(st, record)
+
+
+def _written_row(st, record) -> None:
+    import hashlib
+
+    token = hashlib.sha256(record.key.encode("utf-8")).hexdigest()[:12]
+    folder = document_folder(record.key)
+    written = format_deadline(date.fromisoformat(record.written_on))
+    status = "Applied" if record.applied == "yes" else "Not yet"
+    st.subheader(record.title)
+    st.caption(f"{record.company} · {written} · {status}")
+    show_key = f"docs-show-{token}"
+    cv_pdf = folder / "cv.pdf"
+    cover_pdf = folder / "cover.pdf"
+    if cv_pdf.is_file():
+        if st.button("CV.pdf", key=f"docs-open-cv-{token}"):
+            st.session_state[show_key] = "cv"
+            st.rerun()
+        st.download_button(
+            "Download CV",
+            data=cv_pdf.read_bytes(),
+            file_name="CV.pdf",
+            mime="application/pdf",
+            key=f"docs-download-cv-{token}",
+        )
+        if st.session_state.get(show_key) == "cv" and (folder / "cv-preview.txt").is_file():
+            st.text((folder / "cv-preview.txt").read_text(encoding="utf-8"))
+    if cover_pdf.is_file():
+        if st.button("Cover-letter.pdf", key=f"docs-open-letter-{token}"):
+            st.session_state[show_key] = "cover"
+            st.rerun()
+        st.download_button(
+            "Download cover letter",
+            data=cover_pdf.read_bytes(),
+            file_name="Cover-letter.pdf",
+            mime="application/pdf",
+            key=f"docs-download-letter-{token}",
+        )
+        if st.session_state.get(show_key) == "cover" and (folder / "cover-preview.txt").is_file():
+            st.text((folder / "cover-preview.txt").read_text(encoding="utf-8"))
+    if st.button("Yes", key=f"docs-applied-yes-{token}"):
+        _store_written(st, record, "yes")
+    if st.button("Not yet", key=f"docs-applied-not-yet-{token}"):
+        _store_written(st, record, "not_yet")
+
+
+def _store_written(st, record, applied: str) -> None:
+    try:
+        set_applied(record.key, applied, title=record.title, company=record.company)
+    except CareerCopilotError as exc:
+        st.error(_public_error(exc))
+        return
+    st.rerun()
 
 
 def _page_user(st) -> None:
@@ -370,6 +437,9 @@ def _page_jobs(st) -> None:
     _init_notes(st, "search-notes", conditions.notes)
     _init_skills(st)
     _profile_card(st, roles, conditions)
+    apply_saved_traits()
+    log = load_log()
+    _refresh_paste(st, log)
     with st.container(border=True):
         if st.button("Automatic search"):
             _run_real_search(st, cv_text, roles, conditions)
@@ -378,15 +448,12 @@ def _page_jobs(st) -> None:
             st.session_state["show_paste"] = True
         if st.session_state.get("show_paste"):
             st.caption("Paste the posting, or one https link.")
-            st.text_area("Job posting or link", key="paste-text", max_chars=8000, height=160)
+            st.text_area("Job posting or link", key="paste-text", max_chars=MAX_JOB_TEXT, height=160)
             if st.button("Match analysis"):
                 _run_paste(st, cv_text, roles, conditions)
             result = st.session_state.get("paste-result")
             if isinstance(result, ListedJob):
                 _job_result(st, result, prefix="paste")
-    apply_saved_traits()
-    log = load_log()
-    _refresh_paste(st, log)
     jobs = visible_jobs(log)
     if jobs:
         st.table(
@@ -452,6 +519,15 @@ def _refresh_paste(st, log) -> None:
 
 def _store_answer(st, ask: str, basis: str, vote: str | None) -> None:
     record_answer(ask, basis, vote)
+    result = st.session_state.get("paste-result")
+    if isinstance(result, ListedJob):
+        revised = revise_job(result, ask, basis, vote)
+        log = load_log()
+        for job in [*log.kept, *log.latest]:
+            if job_key(job) == job_key(revised):
+                revised = job
+                break
+        st.session_state["paste-result"] = revised
     st.rerun()
 
 
@@ -462,17 +538,19 @@ def _possible_rows(job: ListedJob) -> list[tuple[str, str]]:
 
 
 def _possible_block(st, job: ListedJob, prefix: str) -> None:
+    import hashlib
+
     rows = _possible_rows(job)
     if not rows:
         return
     st.subheader("Possible matches")
-    for index, (ask, basis) in enumerate(rows):
+    for ask, basis in rows:
         if basis and basis.casefold() != ask.casefold():
             st.markdown(f"- {ask} — {basis}")
         else:
             st.markdown(f"- {ask}")
         yes_col, no_col = st.columns(2)
-        token = f"{prefix}-{job_key(job)}-{index}"
+        token = hashlib.sha256(f"{prefix}\n{job_key(job)}\n{ask}".encode("utf-8")).hexdigest()[:16]
         if yes_col.button("Yes", key=f"trait-up-{token}"):
             _store_answer(st, ask, basis, "up")
         if no_col.button("No", key=f"trait-down-{token}"):
@@ -549,6 +627,11 @@ def _cv_documents(st, job: ListedJob, prefix: str, token: str, folder: Path) -> 
     show_key = f"preview-{prefix}-{token}"
     if st.button("Generate CV for this job", key=f"{prefix}-generate-cv-{token}"):
         _write_cv(st, job, show_key)
+    notice_path = folder / "cv-notice.txt"
+    if pdf_path.is_file() and notice_path.is_file():
+        notice = notice_path.read_text(encoding="utf-8").strip()
+        if notice:
+            st.caption(notice)
     if pdf_path.is_file():
         name_col, note_col = st.columns([1, 2])
         if name_col.button("CV.pdf", key=f"{prefix}-open-cv-{token}"):
@@ -566,6 +649,7 @@ def _cv_documents(st, job: ListedJob, prefix: str, token: str, folder: Path) -> 
         )
         if st.session_state.get(show_key) == "cv" and preview_path.is_file():
             st.text(preview_path.read_text(encoding="utf-8"))
+        _applied_question(st, job, prefix, token)
 
 
 def _letter_documents(st, job: ListedJob, prefix: str, token: str, folder: Path) -> None:
@@ -589,11 +673,41 @@ def _letter_documents(st, job: ListedJob, prefix: str, token: str, folder: Path)
             st.text(preview_path.read_text(encoding="utf-8"))
 
 
+def _applied_question(st, job: ListedJob, prefix: str, token: str) -> None:
+    st.caption("Did you apply?")
+    answer = _applied_answer(job_key(job))
+    yes_col, later_col = st.columns(2)
+    if yes_col.button("Yes", key=f"{prefix}-applied-yes-{token}"):
+        _store_applied(st, job, "yes")
+    if later_col.button("Not yet", key=f"{prefix}-applied-not-yet-{token}"):
+        _store_applied(st, job, "not_yet")
+    st.caption("You applied." if answer == "yes" else "Not yet.")
+
+
+def _applied_answer(key: str) -> str:
+    current = next((item for item in load_applications() if item.key == key), None)
+    return current.applied if current is not None else "not_yet"
+
+
+def _store_applied(st, job: ListedJob, applied: str) -> None:
+    try:
+        set_applied(job_key(job), applied, title=job.title, company=job.company)
+    except CareerCopilotError as exc:
+        st.error(_public_error(exc))
+        return
+    st.rerun()
+
+
+def _mark_written(job: ListedJob) -> None:
+    remember_cv(job_key(job), job.title, job.company)
+
+
 def _write_cv(st, job: ListedJob, show_key: str) -> None:
     try:
         cv_text = load_cv()
         with st.spinner("Writing the CV."):
             generate_job_cv(cv_text, job.description, job_key(job), propose=propose_cv_sections)
+        _mark_written(job)
     except CareerCopilotError as exc:
         st.error(_public_error(exc))
         return
@@ -606,6 +720,7 @@ def _apply_cv_note(st, job: ListedJob, note: str, show_key: str) -> None:
         cv_text = load_cv()
         with st.spinner("Checking the note."):
             apply_cv_note(cv_text, job.description, job_key(job), note, propose=propose_cv_sections)
+        _mark_written(job)
     except CareerCopilotError as exc:
         st.error(_public_error(exc))
         return
