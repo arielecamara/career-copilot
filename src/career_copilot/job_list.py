@@ -897,14 +897,14 @@ def _apply_traits(points: list[MatchPoint], traits: list[Trait]) -> list[MatchPo
     votes = {trait.ask.casefold(): trait.vote for trait in traits}
     prepared: list[MatchPoint] = []
     for point in points:
-        if point.status != "assumed":
-            prepared.append(point)
-            continue
         vote = votes.get(point.text.casefold())
-        if vote == "down" or not point.basis.strip():
+        if point.status == "assumed" and not point.basis.strip() and vote is None:
             continue
-        if vote == "up":
+        if vote == "up" and point.status in {"assumed", "partial"}:
             prepared.append(MatchPoint(text=point.text, status="match", basis=point.basis))
+            continue
+        if vote == "down" and point.status in {"assumed", "partial"}:
+            prepared.append(MatchPoint(text=point.text, status="no_match", basis=point.basis))
             continue
         prepared.append(point)
     return prepared
@@ -1019,26 +1019,58 @@ def _needs_deadline_note(opening: _Opening) -> bool:
     return _deadline_date(opening.text) is None
 
 
+_DEADLINE_HINT = r"deadline|apply by|closing date|applications close|last day to apply|close date|closes on"
+_DATE_APOSTROPHE = re.compile(r"[\u2018\u2019\u02bc`]")
+
+
+def deadline_on(text: str) -> date | None:
+    return _deadline_date(text)
+
+
+def format_deadline(value: date) -> str:
+    names = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    return f"{value.day} {names[value.month - 1]} {value.year}"
+
+
+def notes_for_display(notes: list[str], description: str) -> list[str]:
+    if deadline_on(description) is None:
+        return list(notes)
+    return [note for note in notes if note != DEADLINE_NOTE]
+
+
 def _deadline_date(text: str) -> date | None:
-    for sentence in _sentences(text):
-        if not _word(sentence, r"deadline|apply by|closing date|applications close|last day to apply|close date"):
+    normalized = _DATE_APOSTROPHE.sub("'", text or "")
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if not lines:
+        lines = _sentences(normalized)
+    for index, line in enumerate(lines):
+        if not _word(line, _DEADLINE_HINT):
             continue
-        found = _date_in(sentence)
+        window = line if index + 1 >= len(lines) else f"{line} {lines[index + 1]}"
+        found = _date_in(window)
         if found is not None:
             return found
     return None
+
+
+def _full_year(year: int) -> int:
+    if year >= 100:
+        return year
+    if year >= 70:
+        return 1900 + year
+    return 2000 + year
 
 
 def _date_in(sentence: str) -> date | None:
     iso = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", sentence)
     if iso:
         return _safe_date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
-    day_first = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(20\d{2})\b", sentence)
+    day_first = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\.?\s+'?(\d{2,4})\b", sentence)
     if day_first and day_first.group(2).casefold() in _MONTHS:
-        return _safe_date(int(day_first.group(3)), _MONTHS[day_first.group(2).casefold()], int(day_first.group(1)))
-    month_first = re.search(r"\b([A-Za-z]+)\s+(\d{1,2}),\s*(20\d{2})\b", sentence)
+        return _safe_date(_full_year(int(day_first.group(3))), _MONTHS[day_first.group(2).casefold()], int(day_first.group(1)))
+    month_first = re.search(r"\b([A-Za-z]+)\.?\s+(\d{1,2}),?\s+'?(\d{2,4})\b", sentence)
     if month_first and month_first.group(1).casefold() in _MONTHS:
-        return _safe_date(int(month_first.group(3)), _MONTHS[month_first.group(1).casefold()], int(month_first.group(2)))
+        return _safe_date(_full_year(int(month_first.group(3))), _MONTHS[month_first.group(1).casefold()], int(month_first.group(2)))
     return None
 
 
@@ -1657,6 +1689,77 @@ def fetch_posting(url: str) -> str:
     if not _posting_page_ok(text):
         raise CareerCopilotError("This page did not return the posting. Paste the text.")
     return text
+
+
+_NOISE_LINE = (
+    "cookie",
+    "privacy policy",
+    "skip to",
+    "share this",
+    "back to all",
+    "similar jobs",
+    "create an alert",
+    "job alert",
+    "accept all",
+    "reject all",
+)
+_SECTION_HEADING = re.compile(
+    r"(?i)^(about( the (role|job|team))?|the role|requirements|responsibilities|qualifications|"
+    r"what we offer|benefits|how to apply|your profile|skills|tasks|the team|who you are|"
+    r"what you.ll do|what you will do|job description)$"
+)
+_PLACE_LABEL = re.compile(r"(?i)^(?:location|local|place|based in)\s*[:\-]?\s*(.+)$")
+
+
+def cleaned_posting(text: str, title: str = "") -> str:
+    """A short posting for the page. Blank lines and site chrome are left out."""
+
+    lines = [line.strip() for line in readable_text(text).splitlines() if line.strip() and not _noise_line(line)]
+    if title and lines and lines[0].lstrip("#").strip().casefold() == title.casefold():
+        lines = lines[1:]
+    blocks: list[str] = []
+    prose: list[str] = []
+
+    def flush() -> None:
+        if prose:
+            blocks.append(" ".join(prose))
+            prose.clear()
+
+    for line in lines:
+        plain = line.lstrip("#").strip().rstrip(":")
+        if _SECTION_HEADING.match(plain):
+            flush()
+            blocks.append(f"**{plain}**")
+            continue
+        if line.startswith(("- ", "* ")):
+            flush()
+            blocks.append(line if line.startswith("- ") else f"- {line[2:].strip()}")
+            continue
+        prose.append(plain)
+    flush()
+    return "\n\n".join(blocks).strip()
+
+
+def posting_place(text: str) -> str:
+    for line in [item.strip() for item in readable_text(text).splitlines() if item.strip()]:
+        labeled = _PLACE_LABEL.match(line.lstrip("#").strip())
+        if labeled:
+            return labeled.group(1)[:80]
+    for line in [item.strip() for item in readable_text(text).splitlines() if item.strip()]:
+        if len(line) <= 60 and any(_has_place(line, city) for city in _NL_CITIES):
+            return line[:80]
+    return ""
+
+
+def posting_workplace(text: str) -> str:
+    return _mentioned_workplace(text)
+
+
+def _noise_line(line: str) -> bool:
+    blob = line.casefold()
+    if len(blob) > 80:
+        return False
+    return any(phrase in blob for phrase in _NOISE_LINE)
 
 
 def readable_text(value: str) -> str:

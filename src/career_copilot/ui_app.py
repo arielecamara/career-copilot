@@ -24,15 +24,20 @@ from career_copilot.inputs import (
 from career_copilot.job import analyze_job
 from career_copilot.job_list import (
     ListedJob,
+    cleaned_posting,
     consider_posting,
     drop_job,
     EMPTY_REASON,
     FALLBACK_REASON,
+    format_deadline,
     keep_job,
     job_key,
     load_log,
     load_traits,
-    readable_text,
+    notes_for_display,
+    posting_place,
+    posting_workplace,
+    deadline_on,
     real_search,
     requested_documents,
     save_trait,
@@ -433,31 +438,50 @@ def _session_cv(st) -> str:
     return text.strip()
 
 
-def _assumed_block(st, job: ListedJob) -> None:
+def _possible_rows(job: ListedJob) -> list[tuple[str, str]]:
+    rows = [(line, "") for line in job.partial]
+    rows.extend((item.ask, item.basis) for item in job.assumed)
+    return rows
+
+
+def _possible_block(st, job: ListedJob) -> None:
     votes = {item.ask.casefold(): item.vote for item in load_traits()}
-    shown = [item for item in job.assumed if votes.get(item.ask.casefold()) != "down"]
-    if not shown:
+    pending = [(ask, basis) for ask, basis in _possible_rows(job) if votes.get(ask.casefold()) not in {"up", "down"}]
+    saved = any(votes.get(ask.casefold()) in {"up", "down"} for ask, _basis in _possible_rows(job))
+    if not pending and not saved:
         return
-    st.subheader("Assumed")
-    for index, item in enumerate(shown):
-        st.markdown(f"- {item.ask} — {item.basis}")
-        if votes.get(item.ask.casefold()) == "up":
-            st.caption("Saved for the next search.")
-            continue
+    st.subheader("Possible matches")
+    if saved:
+        st.caption("Saved for the next search.")
+    for index, (ask, basis) in enumerate(pending):
+        if basis and basis.casefold() != ask.casefold():
+            st.markdown(f"- {ask} — {basis}")
+        else:
+            st.markdown(f"- {ask}")
         yes_col, no_col = st.columns(2)
-        if yes_col.button("👍", key=f"trait-up-{job_key(job)}-{index}"):
-            save_trait(item.ask, item.basis, "up")
+        if yes_col.button("Yes", key=f"trait-up-{job_key(job)}-{index}"):
+            save_trait(ask, basis or ask, "up")
             st.rerun()
-        if no_col.button("👎", key=f"trait-down-{job_key(job)}-{index}"):
-            save_trait(item.ask, item.basis, "down")
+        if no_col.button("No", key=f"trait-down-{job_key(job)}-{index}"):
+            save_trait(ask, basis or ask, "down")
             st.rerun()
 
 
 def _job_result(st, job: ListedJob) -> None:
     st.subheader(job.title)
-    description = readable_text(job.description)
-    if description:
-        st.markdown(description)
+    place = posting_place(job.description)
+    workplace = posting_workplace(job.description)
+    details = [part for part in (job.company, place, workplace, job.source) if part]
+    if details:
+        st.caption(" · ".join(details))
+    found = deadline_on(job.description)
+    if found is not None:
+        st.caption(f"Deadline: {format_deadline(found)}")
+    if job.url.startswith("https://"):
+        st.markdown(f"[Open the original listing]({job.url})")
+    posting = cleaned_posting(job.description, job.title)
+    if posting:
+        st.markdown(posting)
     st.subheader(f"Match: {job.match_percent}%")
     st.subheader("What matches")
     if job.covered:
@@ -465,20 +489,17 @@ def _job_result(st, job: ListedJob) -> None:
             st.markdown(f"- {line}")
     else:
         st.caption("No judged requirement matches.")
-    if job.partial:
-        st.subheader("What partly matches")
-        for line in job.partial:
-            st.markdown(f"- {line}")
-    _assumed_block(st, job)
+    _possible_block(st, job)
     st.subheader("What is missing")
     if job.missing:
         for line in job.missing:
             st.markdown(f"- {line}")
     else:
         st.caption("Nothing in the judged requirements is missing.")
-    if job.notes:
+    notes = notes_for_display(job.notes, job.description)
+    if notes:
         st.subheader("Notes")
-        for line in job.notes:
+        for line in notes:
             st.markdown(f"- {line}")
     st.subheader("Documents")
     documents = requested_documents(job.description)
@@ -489,9 +510,6 @@ def _job_result(st, job: ListedJob) -> None:
 
 
 def _job_detail(st, job: ListedJob) -> None:
-    st.caption(f"{job.company} · {job.source}")
-    if job.url.startswith("https://"):
-        st.markdown(f"[Open the original listing]({job.url})")
     _job_result(st, job)
 
 

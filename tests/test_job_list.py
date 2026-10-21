@@ -19,7 +19,13 @@ from career_copilot.job_list import (
     MatchPoint,
     SearchLog,
     _Opening,
+    cleaned_posting,
     consider_posting,
+    deadline_on,
+    format_deadline,
+    notes_for_display,
+    posting_place,
+    posting_workplace,
     drop_job,
     fetch_posting,
     fits_workplace,
@@ -705,7 +711,9 @@ def test_jobs_page_has_no_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert "https://remotive.com/remote-jobs/one" in visible
     assert "reached 70%" not in visible
     assert "fell short" not in visible
-    assert "What partly matches" in visible
+    assert "Possible matches" in visible
+    assert "What partly matches" not in visible
+    assert "Assumed" not in visible
     assert "Related research" in visible
     assert "Read the CV on the User page first." in visible
     assert "Remotive" in visible
@@ -843,7 +851,9 @@ def test_manual_search_shows_the_match_points(tmp_path: Path, monkeypatch: pytes
     )
     assert "Match: 64%" in visible
     assert "What matches" in visible
-    assert "What partly matches" in visible
+    assert "Possible matches" in visible
+    assert "What partly matches" not in visible
+    assert "Assumed" not in visible
     assert "What is missing" in visible
     assert "Structured research" in visible
     assert "Related catalog work" in visible
@@ -1312,8 +1322,131 @@ def test_an_assumed_point_waits_for_a_vote_and_then_counts(tmp_path: Path):
         path=tmp_path / "jobs.json",
         require_grok=False,
     )
-    assert third.latest[0].match_percent == 50
+    assert third.latest[0].match_percent == 33
     assert third.latest[0].assumed == []
+    assert third.latest[0].partial == []
     assert "Works independently" not in third.latest[0].covered
+    assert "Works independently" in third.latest[0].missing
     assert load_traits(tmp_path / "traits.json")[0].vote == "down"
     assert "Neo4j researcher with a PhD" not in (tmp_path / "jobs.json").read_text(encoding="utf-8")
+
+
+def test_a_short_deadline_on_the_next_line_is_read():
+    text = "Researcher role.\nDeadline\n15 Nov \u201926"
+    found = deadline_on(text)
+    assert found == date(2026, 11, 15)
+    assert format_deadline(found) == "15 Nov 2026"
+    assert deadline_on("Apply by 15 Nov 2026. Remote researcher.") == date(2026, 11, 15)
+
+
+def test_an_abbreviated_deadline_keeps_a_future_job_and_drops_a_past_one(tmp_path: Path):
+    past = _web_opening(
+        "https://example.com/jobs/old-deadline",
+        "Deadline\n15 Nov '20. Remote Neo4j researcher role. " * 4,
+        workplace="Remote",
+    )
+    future = _web_opening(
+        "https://example.com/jobs/new-deadline",
+        "Deadline\n15 Nov '26. Remote Neo4j researcher role. " * 4,
+        workplace="Remote",
+    )
+    outcome = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        discover=lambda: [past, future],
+        skills=["Neo4j"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+        today=date(2026, 10, 21),
+    )
+    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new-deadline"]
+    assert DEADLINE_NOTE not in outcome.latest[0].notes
+    assert deadline_on(outcome.latest[0].description) == date(2026, 11, 15)
+
+
+def test_the_posting_view_drops_blank_lines_and_site_chrome():
+    raw = "\n".join(
+        [
+            "Knowledge Graph Engineer",
+            "",
+            "",
+            "About the role",
+            "",
+            "We hire a researcher.",
+            "",
+            "Cookie settings",
+            "",
+            "Requirements",
+            "",
+            "- Neo4j",
+            "",
+            "Location: Eindhoven",
+        ]
+    )
+    view = cleaned_posting(raw, title="Knowledge Graph Engineer")
+    assert "Knowledge Graph Engineer" not in view
+    assert "**About the role**" in view
+    assert "We hire a researcher." in view
+    assert "Cookie" not in view
+    assert "**Requirements**" in view
+    assert "- Neo4j" in view
+    assert "\n\n\n" not in view
+    assert posting_place(raw) == "Eindhoven"
+    assert posting_workplace("Hybrid role in Eindhoven.") == "Hybrid"
+    assert notes_for_display([DEADLINE_NOTE, "Kept"], "Deadline\n15 Nov '26") == ["Kept"]
+
+
+def test_a_yes_on_a_possible_match_counts_on_the_next_search(tmp_path: Path):
+    def score(_cv: str, _posting: str) -> list[MatchPoint]:
+        return [
+            MatchPoint(text="Neo4j", status="match"),
+            MatchPoint(text="PhD in GIScience or a related field", status="partial"),
+        ]
+
+    page = _web_opening(
+        "https://example.com/jobs/phd",
+        "Remote Neo4j researcher role. PhD in GIScience or a related field. " * 4,
+        workplace="Remote",
+    )
+    first = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=score,
+        discover=lambda: [page],
+        skills=["Neo4j"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    assert first.latest[0].partial == ["PhD in GIScience or a related field"]
+    assert first.latest[0].match_percent == 75
+    save_trait("PhD in GIScience or a related field", "PhD in GIScience or a related field", "up", tmp_path / "traits.json")
+    second = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=score,
+        discover=lambda: [page],
+        skills=["Neo4j"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    assert second.latest[0].match_percent == 100
+    assert second.latest[0].partial == []
+    assert "PhD in GIScience or a related field" in second.latest[0].covered
+    save_trait("PhD in GIScience or a related field", "PhD in GIScience or a related field", "down", tmp_path / "traits.json")
+    third = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=score,
+        discover=lambda: [page],
+        skills=["Neo4j"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    assert third.latest[0].match_percent == 50
+    assert third.latest[0].partial == []
+    assert "PhD in GIScience or a related field" in third.latest[0].missing
