@@ -58,6 +58,8 @@ The system prepares a resume, an optional cover letter, and interview prep. The 
 
 ## Git and communication
 
-- This folder is not a git repository yet. Do not initialize one unless the user asks.
-- Do not commit, push, or publish unless the user says `confirmo`.
+- Local commits record the author name and email already used. Do not change that pair unless the user asks.
+- Never push, never add a remote, and never publish. A push happens only after the user explicitly asks for that push in the chat.
+- Before any push, stop. A public or shared copy must not contain the real name, the real email, the CV, `profile.json`, `.career-copilot/`, or other source documents. Existing commits that contain the real name or email are rewritten to a stand-in name and a private noreply email before that push. GitHub cannot hide an email that is already inside a pushed commit.
+- The CV, the thesis, `profile.json`, generated resumes, and `.career-copilot/` stay out of git.
 - Speak English. Keep updates short. Do not add product scope that `SPEC.md` does not already allow.
