@@ -723,8 +723,9 @@ def test_jobs_page_has_no_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert "Remove this job" in labels
     assert "+" not in labels
     assert "−" not in labels
-    assert "No strength saved." in visible
-    assert "No gap saved." in visible
+    assert "Strengths" not in visible
+    assert "Gaps" not in visible
+    assert "Move to gaps" not in labels
     assert "Automatic search" in labels
     assert "Manual search" in labels
     assert "The posting does not mention the employment type." in visible
@@ -1631,23 +1632,9 @@ def test_yes_on_the_job_page_moves_the_line_into_what_matches(tmp_path: Path, mo
     assert "Related research" in visible
     assert "Match: 67%" in visible
     assert "What matches" in visible
-    assert "Strengths" in visible
+    assert "Strengths" not in visible
+    assert "Gaps" not in visible
+    assert "Move to gaps" not in [item.label for item in app.button]
     traits = (tmp_path / ".career-copilot" / "traits.json").read_text(encoding="utf-8")
     assert "Related research" in traits
     assert '"vote": "up"' in traits
-    next(item for item in app.button if item.label == "Move to gaps").click().run()
-    assert not app.exception, app.exception
-    moved = "\n".join(str(item.value) for item in list(app.subheader) + list(app.markdown))
-    assert "Match: 33%" in moved
-    assert "Related research" in moved
-    assert "Researcher" in moved
-    gap_traits = (tmp_path / ".career-copilot" / "traits.json").read_text(encoding="utf-8")
-    assert '"vote": "down"' in gap_traits
-    next(item for item in app.button if item.label == "Clear").click().run()
-    assert not app.exception, app.exception
-    cleared = "\n".join(str(item.value) for item in list(app.subheader) + list(app.markdown) + list(app.caption))
-    assert "Possible matches" in cleared
-    assert "Match: 50%" in cleared
-    assert "No strength saved." in cleared
-    assert "No gap saved." in cleared
-    assert load_traits(tmp_path / ".career-copilot" / "traits.json") == []

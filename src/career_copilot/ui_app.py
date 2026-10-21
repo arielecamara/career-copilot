@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from datetime import date
 from pathlib import Path
 
@@ -34,7 +33,6 @@ from career_copilot.job_list import (
     keep_job,
     job_key,
     load_log,
-    load_traits,
     notes_for_display,
     record_answer,
     apply_saved_traits,
@@ -600,45 +598,6 @@ def _stored_search_file():
         return None
 
 
-def _answer_token(ask: str) -> str:
-    return hashlib.sha256(ask.casefold().encode("utf-8")).hexdigest()[:16]
-
-
-def _saved_answers(st) -> None:
-    try:
-        traits = load_traits()
-    except CareerCopilotError:
-        st.caption("The saved answers could not be read.")
-        return
-    st.markdown("**Strengths**")
-    st.caption("Yes on a possible match is a strength. No is a gap. A line without an answer stays on that job only.")
-    strengths = [trait for trait in traits if trait.vote == "up"]
-    gaps = [trait for trait in traits if trait.vote == "down"]
-    if strengths:
-        for trait in strengths:
-            _answer_row(st, trait, "Move to gaps", "down")
-    else:
-        st.caption("No strength saved.")
-    st.markdown("**Gaps**")
-    if gaps:
-        for trait in gaps:
-            _answer_row(st, trait, "Move to strengths", "up")
-    else:
-        st.caption("No gap saved.")
-
-
-def _answer_row(st, trait, switch_label: str, switch_vote: str) -> None:
-    st.markdown(f"- {trait.ask}")
-    if trait.basis.casefold() != trait.ask.casefold():
-        st.caption(trait.basis)
-    token = _answer_token(trait.ask)
-    switch_col, clear_col = st.columns(2)
-    if switch_col.button(switch_label, key=f"trait-switch-{token}"):
-        _store_answer(st, trait.ask, trait.basis, switch_vote)
-    if clear_col.button("Clear", key=f"trait-clear-{token}"):
-        _store_answer(st, trait.ask, trait.basis, None)
-
-
 def _profile_card(st, roles: list[WorkRole], conditions) -> None:
     with st.container(border=True):
         st.subheader("Profile")
@@ -654,7 +613,6 @@ def _profile_card(st, roles: list[WorkRole], conditions) -> None:
         st.markdown("**Languages**")
         st.markdown(conditions.languages.strip() or "Not set")
         st.text_area("Other notes", key="search-notes", height=140, max_chars=_NOTES_LIMIT)
-        _saved_answers(st)
         if st.button("Save profile"):
             try:
                 _save_profile(st, conditions)
