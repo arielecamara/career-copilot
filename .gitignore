@@ -1,0 +1,11 @@
+.career-copilot/
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+profile.json
+sample-cv.pdf
+LatexThesis_1Vr.pdf
+out/

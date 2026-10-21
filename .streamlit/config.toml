@@ -1,0 +1,13 @@
+[client]
+showErrorDetails = "none"
+showErrorLinks = "false"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+address = "127.0.0.1"
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+allowedHosts = ["localhost", "127.0.0.1"]

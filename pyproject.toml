@@ -1,0 +1,30 @@
+[project]
+name = "career-copilot"
+version = "0.1.0"
+description = "Local tool that turns DOCX and single-column PDF documents into a confirmable profile of evidence atoms."
+requires-python = ">=3.11"
+dependencies = [
+    "pdfplumber>=0.11",
+    "pydantic>=2.6",
+    "python-docx>=1.1",
+    "streamlit>=1.39",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "reportlab>=4.0",
+]
+
+[project.scripts]
+career-copilot = "career_copilot.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
