@@ -22,6 +22,14 @@ from career_copilot.inputs import (
     require_job_text,
 )
 from career_copilot.job import analyze_job
+from career_copilot.job_documents import (
+    apply_cv_note,
+    document_folder,
+    generate_cover_letter,
+    generate_job_cv,
+    propose_cover_letter,
+    propose_cv_sections,
+)
 from career_copilot.job_list import (
     ListedJob,
     cleaned_posting,
@@ -513,12 +521,108 @@ def _job_result(st, job: ListedJob, *, actions: bool = False, prefix: str = "ope
         st.subheader("Notes")
         for line in notes:
             st.markdown(f"- {line}")
-    st.subheader("Documents")
+    _documents_block(st, job, prefix)
+
+
+def _documents_block(st, job: ListedJob, prefix: str) -> None:
+    import hashlib
+
+    token = hashlib.sha256(job_key(job).encode("utf-8")).hexdigest()[:12]
+    folder = document_folder(job_key(job))
     documents = requested_documents(job.description)
+    st.subheader("Documents")
     for name in documents:
-        st.markdown(f"- {name}")
+        if name == "CV":
+            _cv_documents(st, job, prefix, token, folder)
+        elif name == "Cover letter":
+            _letter_documents(st, job, prefix, token, folder)
+        else:
+            st.markdown(f"- {name}")
+            st.caption("Bring your own file.")
     if documents == ["CV"]:
         st.caption("Only the CV is required.")
+
+
+def _cv_documents(st, job: ListedJob, prefix: str, token: str, folder: Path) -> None:
+    pdf_path = folder / "cv.pdf"
+    preview_path = folder / "cv-preview.txt"
+    show_key = f"preview-{prefix}-{token}"
+    if st.button("Generate CV for this job", key=f"{prefix}-generate-cv-{token}"):
+        _write_cv(st, job, show_key)
+    if pdf_path.is_file():
+        name_col, note_col = st.columns([1, 2])
+        if name_col.button("CV.pdf", key=f"{prefix}-open-cv-{token}"):
+            st.session_state[show_key] = "cv"
+            st.rerun()
+        note_col.text_area("Notes", key=f"{prefix}-cv-note-{token}", height=80, max_chars=1000)
+        if st.button("Apply", key=f"{prefix}-apply-cv-{token}"):
+            _apply_cv_note(st, job, str(st.session_state.get(f"{prefix}-cv-note-{token}", "")), show_key)
+        st.download_button(
+            "Download CV",
+            data=pdf_path.read_bytes(),
+            file_name="CV.pdf",
+            mime="application/pdf",
+            key=f"{prefix}-download-cv-{token}",
+        )
+        if st.session_state.get(show_key) == "cv" and preview_path.is_file():
+            st.text(preview_path.read_text(encoding="utf-8"))
+
+
+def _letter_documents(st, job: ListedJob, prefix: str, token: str, folder: Path) -> None:
+    pdf_path = folder / "cover.pdf"
+    preview_path = folder / "cover-preview.txt"
+    show_key = f"preview-{prefix}-{token}"
+    if st.button("Generate cover letter for this job", key=f"{prefix}-generate-letter-{token}"):
+        _write_letter(st, job, show_key)
+    if pdf_path.is_file():
+        if st.button("Cover-letter.pdf", key=f"{prefix}-open-letter-{token}"):
+            st.session_state[show_key] = "cover"
+            st.rerun()
+        st.download_button(
+            "Download cover letter",
+            data=pdf_path.read_bytes(),
+            file_name="Cover-letter.pdf",
+            mime="application/pdf",
+            key=f"{prefix}-download-letter-{token}",
+        )
+        if st.session_state.get(show_key) == "cover" and preview_path.is_file():
+            st.text(preview_path.read_text(encoding="utf-8"))
+
+
+def _write_cv(st, job: ListedJob, show_key: str) -> None:
+    try:
+        cv_text = load_cv()
+        with st.spinner("Writing the CV."):
+            generate_job_cv(cv_text, job.description, job_key(job), propose=propose_cv_sections)
+    except CareerCopilotError as exc:
+        st.error(_public_error(exc))
+        return
+    st.session_state[show_key] = "cv"
+    st.rerun()
+
+
+def _apply_cv_note(st, job: ListedJob, note: str, show_key: str) -> None:
+    try:
+        cv_text = load_cv()
+        with st.spinner("Checking the note."):
+            apply_cv_note(cv_text, job.description, job_key(job), note, propose=propose_cv_sections)
+    except CareerCopilotError as exc:
+        st.error(_public_error(exc))
+        return
+    st.session_state[show_key] = "cv"
+    st.rerun()
+
+
+def _write_letter(st, job: ListedJob, show_key: str) -> None:
+    try:
+        cv_text = load_cv()
+        with st.spinner("Writing the cover letter."):
+            generate_cover_letter(cv_text, job.description, job_key(job), propose=propose_cover_letter)
+    except CareerCopilotError as exc:
+        st.error(_public_error(exc))
+        return
+    st.session_state[show_key] = "cover"
+    st.rerun()
 
 
 def _job_detail(st, job: ListedJob) -> None:

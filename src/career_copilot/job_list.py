@@ -705,6 +705,12 @@ def requested_documents(text: str) -> list[str]:
         documents.append("Portfolio")
     if _word(blob, r"transcripts?"):
         documents.append("Transcript")
+    if _word(blob, r"writing\s+samples?"):
+        documents.append("Writing sample")
+    if _word(blob, r"certificates?") or _word(blob, r"certifications?"):
+        documents.append("Certificate")
+    if _word(blob, r"id"):
+        documents.append("ID")
     return documents
 
 

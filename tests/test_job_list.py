@@ -571,6 +571,12 @@ def test_requested_documents_always_include_the_cv():
         "Transcript",
     ]
     assert requested_documents("A letter of motivation is welcome.") == ["CV", "Cover letter"]
+    assert requested_documents("Bring a writing sample, a certificate, and an ID.") == [
+        "CV",
+        "Writing sample",
+        "Certificate",
+        "ID",
+    ]
 
 
 def test_a_lone_link_is_read_without_sending_the_cv(tmp_path: Path):

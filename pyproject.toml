@@ -7,13 +7,13 @@ dependencies = [
     "pdfplumber>=0.11",
     "pydantic>=2.6",
     "python-docx>=1.1",
+    "reportlab>=4.0",
     "streamlit>=1.39",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "reportlab>=4.0",
 ]
 
 [project.scripts]
