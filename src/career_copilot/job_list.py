@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from career_copilot.errors import CareerCopilotError
 from career_copilot.roles import FAST_MODEL, WorkRole, child_env, grok_score_argv, grok_search_argv
 from career_copilot.search_intent import SearchConditions
-from career_copilot.vocab import skill_named_in
+from career_copilot.vocab import looks_like_heading, normalize_heading, skill_named_in
 
 HIGH_MATCH = 70
 MIN_MATCH = 50
@@ -38,21 +38,7 @@ WEB_SHOWN = 3
 _CALL_TIMEOUT_SECONDS = 60
 TARGET_MATCH = 65
 _LINKS_PER_QUERY = 3
-_POSTING_TERMS = (
-    "OWL",
-    "RDF",
-    "RDFS",
-    "SPARQL",
-    "SHACL",
-    "SKOS",
-    "JSON-LD",
-    "Ontology Engineering",
-    "GraphRAG",
-    "Graphwise",
-    "Linked Data",
-    "CIDOC-CRM",
-)
-_POSTING_TERM_KEYS = {term.casefold() for term in _POSTING_TERMS}
+_POSSIBLE_CAP = 8
 FALLBACK_REASON = "Nada foi encontrado, então retornamos a vaga com o maior match com o seu CV."
 EMPTY_REASON = "Nada foi encontrado."
 UNSCORED_NOTE = "The match was not scored."
@@ -862,35 +848,372 @@ def _quick_match(
     return match_percent(points) or 0, points
 
 
+# Ordinary words and job-ad words. Not a list of skills to show.
+_HARD_STOP = {
+    "a", "an", "the", "and", "or", "of", "for", "to", "in", "on", "at", "by", "with", "from", "as",
+    "into", "over", "under", "about", "after", "before", "between", "through", "during", "without",
+    "within", "via", "per", "plus", "using", "use", "used", "uses", "including", "include", "includes",
+    "than", "then", "that", "this", "these", "those", "its", "we", "our", "you", "your", "they",
+    "their", "them", "who", "which", "what", "when", "where", "how", "why", "not", "no", "yes", "be",
+    "is", "are", "was", "were", "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "can", "could", "should", "may", "might", "must", "shall", "also", "such", "other",
+    "more", "most", "some", "any", "all", "each", "both", "only", "just", "very", "new", "well",
+    "across", "among", "onto", "off", "out", "up", "down", "if", "but", "so", "nor", "yet", "their",
+    "remote", "hybrid", "onsite", "office", "offices", "vacancy", "job", "jobs", "role", "roles",
+    "position", "positions", "opportunity", "opportunities", "team", "teams", "company", "work",
+    "working", "experience", "experienced", "years", "year", "requirement", "requirements",
+    "responsibility", "responsibilities", "qualification", "qualifications", "benefit", "benefits",
+    "offer", "salary", "location", "apply", "application", "applications", "candidate", "candidates",
+    "preferred", "required", "nice", "bonus", "skill", "skills", "ability", "abilities", "strong",
+    "excellent", "good", "great", "proven", "solid", "background", "degree", "diploma", "university",
+    "college", "looking", "join", "joining", "seeking", "wanted", "welcome", "description", "profile",
+    "duties", "duty", "task", "tasks", "culture", "equal", "employer", "employment", "hour", "hours",
+    "week", "weeks", "month", "months", "day", "days", "time", "based", "level", "full", "part",
+    "contract", "permanent", "temporary", "freelance", "internship", "please", "note", "build",
+    "building", "help", "make", "making", "need", "needs", "someone", "people", "person", "within",
+    "across", "including", "etc", "eg", "ie",
+}
+_ROLE_WORDS = {
+    "engineer", "engineers", "researcher", "researchers", "manager", "managers", "developer",
+    "developers", "consultant", "consultants", "specialist", "specialists", "analyst", "analysts",
+    "intern", "interns", "lead", "leader", "leaders", "director", "directors", "officer", "officers",
+    "associate", "associates", "coordinator", "coordinators", "assistant", "assistants", "head",
+    "chief", "senior", "junior", "staff", "administrator", "administrators", "professor", "lecturer",
+}
+_WEAK_WORDS = {
+    "data", "software", "system", "systems", "solution", "solutions", "service", "services",
+    "technology", "technologies", "tool", "tools", "application", "applications", "platform",
+    "platforms", "environment", "environments", "information", "project", "projects", "business",
+    "product", "products", "process", "processes", "model", "models", "research", "science",
+    "engineering", "development", "design", "support", "management", "network", "networks",
+    "digital", "learning", "knowledge", "processing", "language", "general", "related", "technical",
+    "multiple", "various", "several", "modern", "advanced", "basic", "practical", "professional",
+    "relevant", "similar", "complex", "simple", "popular", "additional", "current", "existing",
+    "large", "small", "high", "low", "best", "open", "source", "group", "groups", "field", "area",
+    "areas", "world", "user", "users", "client", "clients", "customer", "customers",
+}
+_MONTHS = {
+    "january", "february", "march", "april", "may", "june", "july", "august", "september",
+    "october", "november", "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep",
+    "sept", "oct", "nov", "dec",
+}
+_LANGUAGES = {
+    "english", "dutch", "german", "french", "spanish", "portuguese", "italian", "chinese",
+    "japanese", "korean", "arabic", "russian", "swedish", "norwegian", "danish", "finnish",
+    "polish", "turkish", "hindi", "flemish", "nederlands", "engels", "duits", "frans",
+}
+_DEGREES = {"phd", "ph.d", "bsc", "msc", "mba", "ba", "ma", "md", "jd", "beng", "meng", "bba"}
+_ORDINARY_ACRONYMS = _DEGREES | {
+    "cv", "id", "eu", "us", "uk", "hr", "am", "pm", "ok", "pdf", "url", "na", "tbd", "asap",
+    "fyi", "faq", "eta", "diy", "nl", "en", "fr", "de", "es", "pt", "pl", "sv", "da",
+    "and", "or", "the", "for", "with", "from", "your", "our", "you", "we", "are", "was", "has",
+    "had", "not", "but", "all", "any", "can", "may", "must", "will", "who", "how", "what",
+    "when", "where", "why", "this", "that", "they", "them", "their", "about", "into", "over",
+    "than", "then", "also", "only", "just", "more", "most", "some", "such", "other", "new",
+    "role", "job", "team", "work", "have", "been", "were", "required", "preferred", "skills",
+    "skill", "plus", "nice", "bonus", "apply", "note", "none", "true", "false", "yes", "no",
+    "key", "core", "main", "per", "via", "etc", "is", "as", "be", "do", "if", "so", "up", "my",
+    "at", "in", "on", "to", "of", "by", "re", "an",
+}
+_HYPHEN_BOILER = {
+    "full-time", "part-time", "long-term", "short-term", "on-site", "in-house", "day-to-day",
+    "hands-on", "well-known", "state-of-the-art", "end-to-end", "real-world", "cross-functional",
+    "self-motivated", "detail-oriented", "results-driven", "fast-paced", "high-quality",
+    "well-rounded", "year-round", "up-to-date", "all-round", "follow-up",
+}
+_DOTTED_STOP = {"e.g", "i.e", "ph.d", "u.s", "u.k", "a.m", "p.m", "dr", "mr", "mrs", "ms", "prof", "etc"}
+_CUE_WORDS = {"with", "using", "use", "uses", "used", "including", "include", "includes", "plus", "via"}
+_CONTINUATIONS = {"and", "or"}
+_TRANSPARENT = {
+    "the", "a", "an", "our", "your", "their", "modern", "robust", "scalable", "latest", "various",
+    "multiple", "several", "strong", "solid", "proven", "excellent", "good", "great", "deep",
+    "practical", "professional", "relevant", "similar", "advanced", "basic", "complex", "simple",
+    "popular", "leading", "key", "core", "main", "primary", "additional", "new", "other", "such",
+}
+_AD_HEADINGS = {
+    normalize_heading(item)
+    for item in (
+        "About the role",
+        "About the job",
+        "About us",
+        "About the team",
+        "Job description",
+        "The role",
+        "Your profile",
+        "Your responsibilities",
+        "Key responsibilities",
+        "What you will do",
+        "What you'll do",
+        "What you will bring",
+        "What we offer",
+        "We offer",
+        "Our offer",
+        "Requirements",
+        "Responsibilities",
+        "Qualifications",
+        "Nice to have",
+        "Must have",
+        "Benefits",
+        "How to apply",
+        "Who you are",
+        "Who we are",
+        "The team",
+        "Your tasks",
+    )
+}
+_EXTRA_PLACES = {
+    "netherlands", "holland", "nederland", "germany", "deutschland", "france", "belgium", "belgie",
+    "spain", "portugal", "italy", "europe", "european", "usa", "america", "england", "scotland",
+    "wales", "ireland", "canada", "australia", "india", "brazil", "china", "japan", "sweden",
+    "norway", "denmark", "finland", "poland", "austria", "switzerland", "luxembourg", "singapore",
+    "london", "berlin", "paris", "brussels", "antwerp", "lisbon", "madrid", "barcelona", "rome",
+    "milan", "vienna", "zurich", "geneva", "dublin", "edinburgh", "manchester", "birmingham",
+    "glasgow", "york", "singapore", "tokyo", "sydney", "toronto", "boston", "seattle", "chicago",
+    "austin", "copenhagen", "stockholm", "oslo", "helsinki", "warsaw", "prague", "budapest",
+    "porto", "utrecht", "amsterdam", "rotterdam", "remote", "worldwide", "international",
+    "united", "kingdom", "states", "republic",
+}
+_PLACES = set(_NL_CITIES) | _EXTRA_PLACES
+_TOKEN_RE = re.compile(r"\.?[A-Za-z](?:[+#]+|[A-Za-z0-9]*)(?:[.+#/-][A-Za-z0-9]+)*[+#]?")
+_ACRONYM_SPLIT = re.compile(r"[.+#/|-]+")
+
+
+def _is_heading_line(line: str) -> bool:
+    cleaned = re.sub(r"^[-*•]\s+", "", line.strip().lstrip("#").strip()).rstrip(":").strip()
+    if not cleaned or len(cleaned) > 80:
+        return False
+    if looks_like_heading(cleaned):
+        return True
+    return normalize_heading(cleaned) in _AD_HEADINGS
+
+
+def _blocked_term(token: str) -> bool:
+    key = token.casefold()
+    return (
+        key in _HARD_STOP
+        or key in _ROLE_WORDS
+        or key in _PLACES
+        or key in _MONTHS
+        or key in _LANGUAGES
+        or key in _DEGREES
+        or key in _ORDINARY_ACRONYMS
+        or key in _HYPHEN_BOILER
+    )
+
+
+def _is_acronym(token: str) -> bool:
+    parts = [part for part in _ACRONYM_SPLIT.split(token) if part]
+    if not parts or not all(part.isalpha() and part.isupper() for part in parts):
+        return False
+    letters = sum(len(part) for part in parts)
+    return 2 <= letters <= 8
+
+
+def _is_hyphenated(token: str) -> bool:
+    parts = token.split("-")
+    return len(parts) >= 2 and all(len(part) >= 2 and part.isalpha() for part in parts)
+
+
+def _is_camel(token: str) -> bool:
+    return bool(token) and token[0].isalpha() and any(char.isupper() for char in token[1:]) and any(char.islower() for char in token)
+
+
+def _strong_token(token: str) -> bool:
+    """Acronyms, digits, symbols, camel case, and hyphenated technical tokens."""
+
+    key = token.casefold()
+    if _blocked_term(token) or key in _DOTTED_STOP:
+        return False
+    if _is_acronym(token):
+        return True
+    if any(char.isdigit() for char in token) and any(char.isalpha() for char in token):
+        return True
+    if any(char in "+#" for char in token):
+        return True
+    if "." in token:
+        letters = re.sub(r"[^A-Za-z]", "", token)
+        return len(letters) >= 2
+    if "-" in token and _is_hyphenated(token):
+        return True
+    return "-" not in token and _is_camel(token)
+
+
+def _phrase_word(token: str) -> bool:
+    if re.fullmatch(r"[A-Z][a-z]{2,}", token) is None:
+        return False
+    key = token.casefold()
+    return key not in _HARD_STOP and key not in _ROLE_WORDS and key not in _PLACES and key not in _MONTHS and key not in _LANGUAGES
+
+
+def _phrase_end(line: str, tokens: list[re.Match[str]], start: int) -> int | None:
+    if not _phrase_word(tokens[start].group(0)):
+        return None
+    end = start + 1
+    while end < len(tokens) and end - start < 3:
+        gap = line[tokens[end - 1].end() : tokens[end].start()]
+        if not gap.isspace() or not _phrase_word(tokens[end].group(0)):
+            break
+        end += 1
+    if end - start < 2:
+        return None
+    return end
+
+
+def _single_candidate(token: str) -> bool:
+    if _blocked_term(token) or token.casefold() in _WEAK_WORDS or _strong_token(token):
+        return False
+    if re.fullmatch(r"[A-Z][a-z]{2,}", token):
+        return True
+    return re.fullmatch(r"[a-z][a-z0-9]{2,}", token) is not None
+
+
+def _next_continues(line: str, tokens: list[re.Match[str]], index: int) -> bool:
+    if index + 1 >= len(tokens):
+        return False
+    gap = line[tokens[index].end() : tokens[index + 1].start()]
+    if "," in gap:
+        return True
+    return tokens[index + 1].group(0).casefold() in _CONTINUATIONS
+
+
+def _line_terms(line: str, offset: int) -> list[tuple[int, int, str]]:
+    if _is_heading_line(line):
+        return []
+    tokens = list(_TOKEN_RE.finditer(line))
+    if not tokens:
+        return []
+    found: list[tuple[int, int, str]] = []
+    consumed: set[int] = set()
+    index = 0
+    while index < len(tokens):
+        phrase_end = _phrase_end(line, tokens, index)
+        if phrase_end is None:
+            index += 1
+            continue
+        text = " ".join(tokens[item].group(0) for item in range(index, phrase_end))
+        if text.casefold() not in _PLACES:
+            found.append((2, offset + tokens[index].start(), text))
+        consumed.update(range(index, phrase_end))
+        index = phrase_end
+    bullet = re.match(r"\s*(?:[-*•]|\d+[.)])\s+", line) is not None
+    sentence_start = not bullet
+    armed = False
+    active = False
+    previous_end = 0
+    for index, match in enumerate(tokens):
+        gap = line[previous_end : match.start()]
+        previous_end = match.end()
+        if re.search(r"[.!?]", gap):
+            sentence_start = True
+            armed = False
+            active = False
+        comma = "," in gap
+        token = match.group(0)
+        key = token.casefold()
+        if key in _CUE_WORDS:
+            armed = True
+            active = False
+            sentence_start = False
+            continue
+        if key in _CONTINUATIONS and (armed or active or comma):
+            armed = True
+            sentence_start = False
+            continue
+        if key in _TRANSPARENT and (armed or active or comma):
+            sentence_start = False
+            continue
+        if comma and (armed or active):
+            armed = True
+        if index not in consumed and _strong_token(token):
+            found.append((1, offset + match.start(), token))
+            if armed or active or comma:
+                active = True
+                armed = False
+            sentence_start = False
+            continue
+        if index in consumed:
+            if armed or active or comma:
+                active = True
+                armed = False
+            sentence_start = False
+            continue
+        single = _single_candidate(token)
+        listed = single and (armed or active)
+        mid = single and not sentence_start and re.fullmatch(r"[A-Z][a-z]{2,}", token) is not None
+        starts = single and sentence_start and _next_continues(line, tokens, index)
+        alone = single and len(tokens) == 1
+        on_bullet = single and bullet and index == 0
+        if listed or mid or starts or alone or on_bullet:
+            found.append((3, offset + match.start(), token))
+            active = True
+            armed = False
+        else:
+            active = False
+            armed = False
+        sentence_start = False
+    return found
+
+
+def _technical_terms(posting: str) -> list[tuple[int, int, str]]:
+    """Technical terms from the posting, strongest first, then document order."""
+
+    found: list[tuple[int, int, str]] = []
+    offset = 0
+    for line in posting.splitlines() or [posting]:
+        found.extend(_line_terms(line, offset))
+        offset += len(line) + 1
+    best: dict[str, tuple[int, int, str]] = {}
+    for priority, position, text in found:
+        cleaned = " ".join(text.split())
+        key = cleaned.casefold()
+        if not cleaned:
+            continue
+        item = (priority, position, cleaned)
+        current = best.get(key)
+        if current is None or item[0] < current[0] or (item[0] == current[0] and item[1] < current[1]):
+            best[key] = item
+    return sorted(best.values(), key=lambda item: (item[0], item[1]))
+
+
+def _clearly_written(term: str, text: str) -> bool:
+    if not term.strip() or not text.strip():
+        return False
+    if skill_named_in(term, text):
+        return True
+    phrase = _fold_phrase(term)
+    if not phrase or min(len(part) for part in phrase) < 2:
+        return False
+    return _term_in_text(text, term)
+
+
+def _named_in_points(term: str, points: list[MatchPoint]) -> bool:
+    for point in points:
+        if term.casefold() == point.text.casefold() or skill_named_in(term, point.text):
+            return True
+    return False
+
+
 def _attach_possible_terms(
     points: list[MatchPoint],
     cv_text: str,
     posting: str,
     traits: list[Trait],
 ) -> list[MatchPoint]:
-    """Terms written in the posting and not written in the CV stay out of the percent."""
+    """Technical terms written in the posting and not clearly written in the CV stay out of the percent."""
 
     taken = {point.text.casefold() for point in points}
-    extra: list[MatchPoint] = []
-    for term in _POSTING_TERMS:
-        if len(extra) == 8:
-            break
-        if term.casefold() in taken or not skill_named_in(term, posting) or skill_named_in(term, cv_text):
+    chosen: list[tuple[int, str]] = []
+    for _priority, position, term in _technical_terms(posting):
+        key = term.casefold()
+        if key in taken or _named_in_points(term, points) or _clearly_written(term, cv_text):
             continue
-        extra.append(MatchPoint(text=term, status="assumed", basis=term))
-        taken.add(term.casefold())
-    converted: list[MatchPoint] = []
-    for point in points:
-        if (
-            point.status == "no_match"
-            and point.text.casefold() in _POSTING_TERM_KEYS
-            and skill_named_in(point.text, posting)
-            and not skill_named_in(point.text, cv_text)
-        ):
-            converted.append(MatchPoint(text=point.text, status="assumed", basis=point.text))
-        else:
-            converted.append(point)
-    return _apply_traits([*converted, *extra], traits)
+        chosen.append((position, term))
+        taken.add(key)
+        if len(chosen) == _POSSIBLE_CAP:
+            break
+    chosen.sort()
+    extra = [MatchPoint(text=term, status="assumed", basis=term) for _position, term in chosen]
+    return _apply_traits([*points, *extra], traits)
 
 
 def _save_open_job(

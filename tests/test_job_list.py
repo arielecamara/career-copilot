@@ -1464,7 +1464,7 @@ def test_a_posting_term_missing_from_the_cv_is_a_possible_match(tmp_path: Path):
     assert agreed.match_percent == 67
     assert [item.ask for item in agreed.assumed] == ["SPARQL", "Ontology Engineering"]
     named = real_search(
-        "Neo4j Cypher SPARQL researcher",
+        "Neo4j Cypher SPARQL Ontology Design researcher",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
         score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
@@ -1473,7 +1473,68 @@ def test_a_posting_term_missing_from_the_cv_is_a_possible_match(tmp_path: Path):
         path=tmp_path / "named.json",
         require_grok=False,
     )
-    assert "SPARQL" not in [item.ask for item in named.latest[0].assumed]
+    named_asks = [item.ask for item in named.latest[0].assumed]
+    assert "SPARQL" not in named_asks
+    assert "Ontology Engineering" in named_asks
+
+
+def test_possible_matches_are_read_from_any_posting(tmp_path: Path):
+    page = _web_opening(
+        "https://example.com/jobs/cloud",
+        "We use Terraform and Kubernetes on AWS. Includes GraphQL and scikit-learn. "
+        "The team in Amsterdam will join the group. Remote Python role. " * 4,
+        title="Engineer",
+        workplace="Remote",
+    )
+    outcome = real_search(
+        "Python researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        discover=lambda: [page],
+        skills=["Python"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    job = outcome.latest[0]
+    assert job.match_percent == 100
+    assert job.covered == ["Python"]
+    assert job.missing == []
+    assert [item.ask for item in job.assumed] == [
+        "Terraform",
+        "Kubernetes",
+        "AWS",
+        "GraphQL",
+        "scikit-learn",
+    ]
+    assert [item.basis for item in job.assumed] == [item.ask for item in job.assumed]
+    crowded = _web_opening(
+        "https://example.com/jobs/crowded",
+        "Remote Python role using ALPHA, BETA, GAMMA, DELTA, EPSILON, ZETA, THETA, IOTA, and KAPPA. "
+        "Also use Figma. " * 4,
+        title="Engineer",
+        workplace="Remote",
+    )
+    capped = real_search(
+        "Python researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        discover=lambda: [crowded],
+        skills=["Python"],
+        path=tmp_path / "capped.json",
+        require_grok=False,
+    )
+    assert [item.ask for item in capped.latest[0].assumed] == [
+        "ALPHA",
+        "BETA",
+        "GAMMA",
+        "DELTA",
+        "EPSILON",
+        "ZETA",
+        "THETA",
+        "IOTA",
+    ]
 
 
 def test_yes_and_no_on_a_posting_term_update_the_match(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
