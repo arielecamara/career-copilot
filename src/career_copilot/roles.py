@@ -257,6 +257,9 @@ def grok_argv(executable: str, prompt_file: Path, cwd: Path) -> list[str]:
     ]
 
 
+FAST_MODEL = "grok-4.7-build-fast"
+
+
 def grok_search_argv(executable: str, prompt_file: Path, cwd: Path) -> list[str]:
     return [
         executable,
@@ -265,14 +268,24 @@ def grok_search_argv(executable: str, prompt_file: Path, cwd: Path) -> list[str]
         "--verbatim",
         "--output-format",
         "json",
+        "--model",
+        FAST_MODEL,
         "--max-turns",
-        "3",
+        "2",
+        "--always-approve",
+        "--no-subagents",
         "--cwd",
         str(cwd),
         "--no-auto-update",
         "--disallowed-tools",
         "run_terminal_cmd,write,search_replace,Agent",
     ]
+
+
+def grok_score_argv(executable: str, prompt_file: Path, cwd: Path) -> list[str]:
+    argv = grok_argv(executable, prompt_file, cwd)
+    index = argv.index("--max-turns")
+    return [*argv[:index], "--model", FAST_MODEL, *argv[index:]]
 
 
 def child_env(source: Mapping[str, str]) -> dict[str, str]:

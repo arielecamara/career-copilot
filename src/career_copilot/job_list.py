@@ -1,8 +1,9 @@
 """Job list for phase 3.
 
-A search asks the local Grok login for public job pages, opens those pages,
-and keeps up to three jobs at 50 percent or above. The CV is used for the
-match. It is not sent to a job site and it is not stored in the job list.
+A search builds a few short queries, asks the local Grok login for https
+links, opens those pages, and keeps up to three jobs at 50 percent or above.
+The CV is used for the match. It is not sent to a job site and it is not
+stored in the job list.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from career_copilot.errors import CareerCopilotError
-from career_copilot.roles import WorkRole, child_env, grok_argv, grok_search_argv
+from career_copilot.roles import WorkRole, child_env, grok_score_argv, grok_search_argv
 from career_copilot.search_intent import SearchConditions
 
 HIGH_MATCH = 70
@@ -38,6 +39,9 @@ WEB_SCORED = 4
 WEB_SHOWN = 3
 SEARCH_TIMEOUT_SECONDS = 240
 _SCORE_RESERVE_SECONDS = 40
+_QUERY_LIMIT = 4
+_QUERY_TIMEOUT_SECONDS = 60
+_OPEN_FLOOR_SECONDS = 70
 FALLBACK_REASON = "Nada foi encontrado, então retornamos a vaga com o maior match com o seu CV."
 EMPTY_REASON = "Nada foi encontrado."
 DEADLINE_NOTE = "The application deadline was not found."
@@ -628,30 +632,6 @@ def _search_web(
         return max(0, SEARCH_TIMEOUT_SECONDS - int(time.monotonic() - started))
 
     removed = sorted(url for url in blocked if url.startswith("https://"))
-    failures: list[CareerCopilotError] = []
-
-    def collect(avoid: list[str], *, again: bool) -> list[_Opening]:
-        if discover is not None:
-            progress("Searching.")
-            return list(discover())
-        try:
-            return _discover_with_grok(
-                roles,
-                conditions,
-                skills,
-                cv_text=cv_text,
-                timeout_seconds=max(1, _discovery_budget(remaining())),
-                progress=progress,
-                skipped=avoid,
-                again=again,
-                time_left=remaining,
-            )
-        except CareerCopilotError as exc:
-            message = str(exc).casefold()
-            if "too long" not in message and "did not return a search" not in message:
-                raise
-            failures.append(exc)
-            return []
 
     def usable(openings: list[_Opening]) -> list[_Opening]:
         prepared = [_with_posting(opening) for opening in openings]
@@ -663,18 +643,20 @@ def _search_web(
             and _web_candidate(opening, cv_text, roles, skills, today)
         ]
 
-    started_search = time.monotonic()
-    found_pages = collect(removed, again=False)
-    saw_pages = bool(found_pages)
+    if discover is not None:
+        progress("Searching.")
+        found_pages = list(discover())
+    else:
+        found_pages = _discover_with_grok(
+            roles,
+            conditions,
+            skills,
+            cv_text=cv_text,
+            progress=progress,
+            skipped=removed,
+            time_left=remaining,
+        )
     candidates = usable(found_pages)
-    quick_miss = not candidates and (time.monotonic() - started_search) < 45 and remaining() >= 90
-    if discover is None and quick_miss:
-        seen = sorted({*removed, *(opening.url for opening in found_pages if opening.url.startswith("https://"))})
-        found_pages = collect(seen, again=True)
-        saw_pages = saw_pages or bool(found_pages)
-        candidates = usable(found_pages)
-    if discover is None and not candidates and not saw_pages and failures:
-        raise failures[-1]
     traits = load_traits(traits_for_jobs(path))
     qualified: list[ListedJob] = []
     weaker: list[ListedJob] = []
@@ -1627,14 +1609,105 @@ def _language_gap(opening: _Opening, conditions: SearchConditions) -> list[Match
     return [MatchPoint(text=f"The posting requires {named}, outside the saved languages.", status="no_match")]
 
 
-def _discovery_budget(remaining: int) -> int:
-    """Seconds for finding pages, leaving time to score the ones that open."""
+def _query_budget(remaining: int) -> int:
+    """Seconds for one short query, leaving time to open and score saved links."""
 
-    if remaining <= 1:
-        return 1
-    if remaining <= _SCORE_RESERVE_SECONDS + 20:
-        return max(1, remaining // 2)
-    return remaining - _SCORE_RESERVE_SECONDS
+    if remaining <= _OPEN_FLOOR_SECONDS:
+        return 0
+    return min(_QUERY_TIMEOUT_SECONDS, remaining - _OPEN_FLOOR_SECONDS)
+
+
+def _unique_terms(values: list[str]) -> list[str]:
+    chosen: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = " ".join(str(value).split())
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            chosen.append(text)
+    return chosen
+
+
+def _quoted(term: str) -> str:
+    text = " ".join(term.split())
+    if " " in text:
+        return f'"{text}"'
+    return text
+
+
+def _or_join(terms: list[str]) -> str:
+    return " OR ".join(_quoted(term) for term in _unique_terms(terms))
+
+
+def _or_group(terms: list[str]) -> str:
+    text = _or_join(terms)
+    if " OR " in text:
+        return f"({text})"
+    return text
+
+
+def _place_terms(conditions: SearchConditions) -> list[str]:
+    """Filled Search fields only. An empty city does not add other cities."""
+
+    terms: list[str] = []
+    netherlands = conditions.country.strip().casefold() in _NL_COUNTRIES
+    for workplace in conditions.workplaces:
+        terms.append(workplace)
+        if workplace.casefold() == "hybrid" and netherlands:
+            terms.append("hybride")
+    if conditions.country.strip():
+        terms.append(conditions.country.strip())
+    if conditions.city.strip():
+        terms.append(conditions.city.strip())
+    return _unique_terms(terms)
+
+
+def _search_queries(roles: list[WorkRole], conditions: SearchConditions, skills: list[str]) -> list[str]:
+    """Three or four short queries. Empty fields and the CV text add nothing."""
+
+    role_names = _unique_terms([role.name for role in roles if role.kept])[:4]
+    skill_names = _unique_terms(list(skills))
+    place = _place_terms(conditions)
+    netherlands = conditions.country.strip().casefold() in _NL_COUNTRIES
+    listing = ["job", "vacature" if netherlands else "vacancy"]
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def add(text: str) -> None:
+        if len(queries) >= _QUERY_LIMIT:
+            return
+        cleaned = " ".join(text.split())
+        key = cleaned.casefold()
+        if cleaned and key not in seen:
+            seen.add(key)
+            queries.append(cleaned)
+
+    lead = skill_names[:4] or role_names
+    role_group = [name for name in role_names if name.casefold() not in {item.casefold() for item in lead}]
+    first = [part for part in (_or_group(lead), _or_group(role_group), _or_group(place), _or_group(["job", "vacancy", "apply now"])) if part]
+    add(" ".join(first))
+    if role_names:
+        add(f"{_or_join(role_names)} {_or_join(place)}".strip())
+    focus = skill_names[:2] or role_names[:1]
+    workplaces = list(conditions.workplaces)
+    if netherlands and any(item.casefold() == "hybrid" for item in workplaces):
+        workplaces.append("hybride")
+    third = [part for part in (_or_join(focus), _or_join(listing), _or_group(workplaces)) if part]
+    if conditions.country.strip():
+        third.append(conditions.country.strip())
+    elif conditions.city.strip():
+        third.append(conditions.city.strip())
+    add(" ".join(third))
+    extra = skill_names[4:8]
+    if extra:
+        more = [part for part in (_or_group(extra), _or_group(place), _or_group(["job", "vacancy"])) if part]
+        add(" ".join(more))
+    if len(queries) < 3 and skill_names and role_names:
+        add(f"{_or_join(skill_names[:2])} {_or_join(role_names)}".strip())
+    if len(queries) < 3 and place and (role_names or skill_names):
+        add(f"{_or_join(role_names or skill_names[:2])} {_or_group(['job', 'vacancy'])} {_or_group(place)}".strip())
+    return queries
 
 
 def _discover_with_grok(
@@ -1642,14 +1715,89 @@ def _discover_with_grok(
     conditions: SearchConditions,
     skills: list[str],
     cv_text: str = "",
-    timeout_seconds: int = SEARCH_TIMEOUT_SECONDS,
     progress: Callable[[str], None] | None = None,
     skipped: list[str] | None = None,
-    again: bool = False,
     time_left: Callable[[], int] | None = None,
 ) -> list[_Opening]:
-    if progress is not None:
-        progress("Searching.")
+    clock = time_left or (lambda: SEARCH_TIMEOUT_SECONDS)
+    items = _collect_search_links(
+        roles,
+        conditions,
+        skills,
+        cv_text=cv_text,
+        skipped=skipped,
+        time_left=clock,
+        progress=progress,
+    )
+    return openings_from_search(
+        items,
+        fetch_posting,
+        conditions,
+        progress=progress,
+        time_left=time_left,
+    )
+
+
+def _collect_search_links(
+    roles: list[WorkRole],
+    conditions: SearchConditions,
+    skills: list[str],
+    *,
+    cv_text: str,
+    skipped: list[str] | None,
+    time_left: Callable[[], int],
+    progress: Callable[[str], None] | None,
+) -> list[dict[str, object]]:
+    queries = _search_queries(roles, conditions, skills)
+    saved: list[dict[str, object]] = []
+    seen: set[str] = set()
+    timed_out = False
+    failed = False
+    total = len(queries)
+    for index, query in enumerate(queries, start=1):
+        budget = _query_budget(time_left())
+        if budget < 1:
+            break
+        if progress is not None:
+            progress(f"Searching {index} of {total}.")
+        try:
+            found = _links_for_query(
+                query,
+                conditions,
+                skipped=skipped,
+                timeout_seconds=budget,
+                cv_text=cv_text,
+            )
+        except CareerCopilotError as exc:
+            message = str(exc).casefold()
+            if "too long" in message:
+                timed_out = True
+                continue
+            if "did not return a search" in message:
+                failed = True
+                continue
+            raise
+        for item in found:
+            url = str(item.get("url", ""))
+            if url in seen:
+                continue
+            seen.add(url)
+            saved.append(item)
+    if saved:
+        return saved
+    if failed and not timed_out:
+        raise CareerCopilotError("Grok did not return a search. Stay signed in with grok login and try again.")
+    return []
+
+
+def _links_for_query(
+    query: str,
+    conditions: SearchConditions,
+    *,
+    skipped: list[str] | None,
+    timeout_seconds: int,
+    cv_text: str = "",
+) -> list[dict[str, object]]:
     executable = shutil.which("grok")
     if executable is None:
         raise CareerCopilotError("Grok is not available in the terminal. Run grok login, then try again.")
@@ -1657,7 +1805,7 @@ def _discover_with_grok(
         directory = Path(folder)
         prompt_file = directory / "prompt.txt"
         prompt_file.write_text(
-            _search_prompt(roles, conditions, skills, cv_text, skipped=skipped, again=again),
+            _query_prompt(query, conditions, skipped=skipped, cv_text=cv_text),
             encoding="utf-8",
         )
         try:
@@ -1675,12 +1823,12 @@ def _discover_with_grok(
             late = exc.stdout or ""
             if isinstance(late, bytes):
                 late = late.decode("utf-8", errors="replace")
-            if not late.strip():
-                raise CareerCopilotError("Grok took too long. Nothing was saved.") from exc
+            if not str(late).strip():
+                return []
             completed = subprocess.CompletedProcess(
                 grok_search_argv(executable, prompt_file, directory),
                 0,
-                stdout=late,
+                stdout=str(late),
                 stderr="",
             )
     found: list[dict[str, object]] = []
@@ -1692,15 +1840,13 @@ def _discover_with_grok(
     if completed.returncode != 0 and not found:
         raise CareerCopilotError("Grok did not return a search. Stay signed in with grok login and try again.")
     avoided = {url for url in (skipped or []) if url.startswith("https://")}
-    if avoided:
-        found = [item for item in found if str(item.get("url", "")).strip()[:500] not in avoided]
-    return openings_from_search(
-        found,
-        fetch_posting,
-        conditions,
-        progress=progress,
-        time_left=time_left,
-    )
+    kept: list[dict[str, object]] = []
+    for item in found:
+        url = str(item.get("url", "")).strip()[:500]
+        if not url.startswith("https://") or url in avoided:
+            continue
+        kept.append({"title": item.get("title", ""), "company": item.get("company", ""), "url": url})
+    return kept
 
 
 def _search_prompt(
@@ -1709,52 +1855,39 @@ def _search_prompt(
     skills: list[str],
     cv_text: str = "",
     skipped: list[str] | None = None,
-    again: bool = False,
 ) -> str:
-    names = ", ".join(role.name for role in roles) or "open roles"
+    queries = _search_queries(roles, conditions, skills)
+    query = queries[0] if queries else "job OR vacancy"
+    return _query_prompt(query, conditions, skipped=skipped, cv_text=cv_text)
+
+
+def _query_prompt(
+    query: str,
+    conditions: SearchConditions,
+    skipped: list[str] | None = None,
+    cv_text: str = "",
+) -> str:
     lines = [
+        "Use the fastest model available.",
         "Search the public web for job postings that are still open.",
-        "Use two web searches. Use the roles, the skills, and the filled fields below.",
-        "Open the best pages, then stop and return the JSON. Do not keep searching after that.",
-        "A blank field is not a preference. Do not add a preference that is not listed.",
+        "Use one web search for the query below, then stop and return the JSON.",
+        "Do not open the pages. Do not run a second search.",
+        "A blank field is not a preference. Do not add a place, a workplace, or a year that is not listed.",
         "Return only JSON:",
-        '{"jobs":[{"title":"role","company":"employer","url":"https://example.com/job","requirements":[{"text":"short requirement","status":"match","basis":""}]}]}',
+        '{"jobs":[{"title":"role","company":"employer","url":"https://example.com/job"}]}',
+        "Each item needs a title, a company, and one https url from the search results.",
         "Rules:",
         "- Use an https link to the employer or another public job page.",
         "- Do not use LinkedIn.",
         "- Do not invent a job, a company, or a link.",
         "- Do not put the CV text into the web search.",
-        "- Do not guess a match percent.",
-        "- status is match, partial, no_match, or assumed.",
-        "- match means the CV states it. partial means only a related part. no_match means the CV does not show it.",
-        "- assumed means the CV does not state it, but one fact in the CV makes it plausible. Put that fact in basis.",
-        "- Leave basis empty unless status is assumed.",
-        f"Roles: {names}.",
+        "- Do not score the CV.",
+        f"Query: {query}",
     ]
-    if again:
-        lines.append("The earlier links were already removed or could not be used. Return different open pages.")
     removed = [url for url in (skipped or []) if url.startswith("https://")]
     if removed:
         lines.append("Do not return these links:")
         lines.extend(removed[:40])
-    if skills:
-        lines.append("Skills: " + ", ".join(skills) + ".")
-    if conditions.levels:
-        lines.append("Experience level: " + ", ".join(conditions.levels) + ".")
-    if conditions.employment:
-        lines.append("Employment: " + ", ".join(conditions.employment) + ".")
-    if conditions.workplaces:
-        lines.append("Workplace: " + ", ".join(conditions.workplaces) + ".")
-    if conditions.country:
-        lines.append(f"Country: {conditions.country}.")
-    if conditions.city:
-        lines.append(f"City: {conditions.city}.")
-    if not conditions.country and not conditions.city:
-        lines.append("Place: worldwide.")
-    elif conditions.country and not conditions.city:
-        lines.append("A country without a city covers the whole country.")
-    if conditions.languages.strip():
-        lines.append(f"Languages: {conditions.languages}.")
     if conditions.notes.strip():
         lines.append("Preferences:")
         lines.append(conditions.notes.strip())
@@ -1767,21 +1900,43 @@ def _search_prompt(
 def _parse_search_jobs(stdout: str) -> list[dict[str, object]]:
     from career_copilot.roles import _json_object
 
+    bodies: list[object] = []
     try:
         body = _json_object(stdout)
-    except CareerCopilotError as exc:
-        raise CareerCopilotError("Grok did not return a search. Stay signed in with grok login and try again.") from exc
-    if isinstance(body.get("text"), str) and "jobs" not in body:
-        try:
-            body = _json_object(str(body["text"]))
-        except CareerCopilotError as exc:
-            raise CareerCopilotError(
-                "Grok did not return a search. Stay signed in with grok login and try again."
-            ) from exc
-    raw = body.get("jobs")
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, dict)]
+    except CareerCopilotError:
+        body = None
+    if isinstance(body, dict):
+        bodies.append(body)
+        text = body.get("text")
+        if isinstance(text, str) and "jobs" not in body:
+            try:
+                bodies.append(_json_object(text))
+            except CareerCopilotError:
+                bodies.append(text)
+    found: list[dict[str, object]] = []
+    for item in bodies:
+        if isinstance(item, dict) and isinstance(item.get("jobs"), list):
+            found.extend(job for job in item["jobs"] if isinstance(job, dict))
+        elif isinstance(item, str):
+            found.extend(_jobs_from_text(item))
+    if found:
+        return found
+    return _jobs_from_text(stdout)
+
+
+def _jobs_from_text(text: str) -> list[dict[str, object]]:
+    jobs: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"https://[^\s\"'<>\\]+", text):
+        url = match.group(0).rstrip(").,;]")
+        host = (urllib.parse.urlparse(url).hostname or "").casefold()
+        if not host or host == "example.com" or host.endswith(".example.com") or _blocked_job_host(host):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        jobs.append({"title": "", "company": "", "url": url})
+    return jobs
 
 
 def openings_from_search(
@@ -1898,13 +2053,14 @@ def _score_with_grok(cv_text: str, posting: str) -> list[MatchPoint]:
         prompt_file = directory / "prompt.txt"
         prompt_file.write_text(_match_prompt(cv_text, posting), encoding="utf-8")
         try:
+            budget = _score_budget.get()
             completed = subprocess.run(
-                grok_argv(executable, prompt_file, directory),
+                grok_score_argv(executable, prompt_file, directory),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=180 if _score_budget.get() is None else max(1, int(_score_budget.get() or 1)),
+                timeout=180 if budget is None else max(1, min(60, int(budget))),
                 env=child_env(os.environ),
                 check=False,
             )

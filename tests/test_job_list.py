@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 
@@ -1057,13 +1058,17 @@ def test_web_discovery_rescores_opened_pages_and_skips_a_dead_link(tmp_path: Pat
     assert fetched == ["https://example.com/jobs/one", "https://example.com/jobs/dead"]
     prompt = _search_prompt(_roles(), clean_conditions([], [], [], "", ""), ["Neo4j"])
     assert "Neo4j" in prompt
-    assert "Use two web searches." in prompt
+    assert "Use one web search" in prompt
     assert "at most 4" not in prompt
     assert "A blank field is not a preference" in prompt
     assert "SECRET" not in prompt
     assert "site:linkedin" not in prompt
     assert "2026" not in prompt
     assert "Prefer light programming" not in prompt
+    assert "requirements" not in prompt
+    query_line = next(line for line in prompt.splitlines() if line.startswith("Query:"))
+    assert "Remote" not in query_line
+    assert "Amsterdam" not in query_line
     empty = real_search(
         "notes",
         _roles(),
@@ -1141,10 +1146,12 @@ def test_notes_guide_the_search_and_do_not_add_a_hard_gap(tmp_path: Path):
     assert "The posting does not mention a language." in quiet.job.notes
     prompt = _search_prompt(_roles(), noted, ["Neo4j"])
     assert "at most 4" not in prompt
-    assert "Use two web searches." in prompt
+    assert "Use one web search" in prompt
     assert "Light programming only." in prompt
     assert "A preference does not by itself exclude a page." in prompt
     assert "Prefer light programming" not in prompt
+    query_line = next(line for line in prompt.splitlines() if line.startswith("Query:"))
+    assert "Light programming" not in query_line
     scored = _scoring_text("The posting body.", _roles(), noted)
     assert "Preferences:\nLight programming only." in scored
     assert "The posting body." in scored
@@ -2146,18 +2153,87 @@ def test_a_plural_skill_still_opens_the_page(tmp_path: Path):
     assert [job.url for job in outcome.latest] == ["https://example.com/jobs/graph"]
 
 
-def test_removed_links_are_left_out_and_the_search_asks_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from career_copilot.job_list import _discovery_budget, _search_prompt
+def test_a_search_reply_keeps_real_links_and_drops_linkedin():
+    from career_copilot.job_list import _parse_search_jobs
 
-    assert _discovery_budget(240) == 200
-    assert _discovery_budget(50) == 25
-    assert _discovery_budget(1) == 1
+    listed = _parse_search_jobs(
+        '{"jobs":[{"title":"Engineer","company":"Lab","url":"https://jobs.example.org/engineer"}]}'
+    )
+    assert [item["url"] for item in listed] == ["https://jobs.example.org/engineer"]
+    prose = (
+        "Found https://www.linkedin.com/jobs/view/1 and https://example.com/job "
+        "and https://boards.greenhouse.io/acme/jobs/1"
+    )
+    found = _parse_search_jobs(prose)
+    assert [item["url"] for item in found] == ["https://boards.greenhouse.io/acme/jobs/1"]
+    wrapped = json.dumps(
+        {
+            "text": 'I will search once.{"jobs":[{"title":"Researcher","company":"Lab","url":"https://jobs.example.org/1"}]}'
+        }
+    )
+    assert _parse_search_jobs(wrapped)[0]["url"] == "https://jobs.example.org/1"
+
+
+def test_short_queries_use_saved_roles_skills_and_the_filled_place():
+    from career_copilot.job_list import _query_budget, _search_queries
+
+    assert _query_budget(240) == 60
+    assert _query_budget(80) == 10
+    assert _query_budget(70) == 0
+    roles = [
+        WorkRole(name="knowledge engineer", reason="The work is knowledge."),
+        WorkRole(name="researcher", reason="The work is research."),
+    ]
+    skills = [
+        "Knowledge Graphs",
+        "Neo4j",
+        "Ontology Design",
+        "Cypher",
+        "CIDOC-CRM",
+        "Python",
+        "Dataiku",
+        "Data Modeling",
+        "Information Retrieval",
+        "Pattern Recognition",
+    ]
+    netherlands = clean_conditions([], [], [], "Netherlands", "")
+    queries = _search_queries(roles, netherlands, skills)
+    assert 3 <= len(queries) <= 4
+    joined = "\n".join(queries)
+    assert "Knowledge Graphs" in joined
+    assert "Neo4j" in joined
+    assert "Ontology Design" in joined
+    assert "knowledge engineer" in joined
+    assert "researcher" in joined
+    assert "Netherlands" in joined
+    assert "vacature" in joined
+    assert "apply now" in queries[0]
+    assert "job" in queries[0] and "vacancy" in queries[0]
+    for query in queries:
+        assert "2026" not in query
+        assert "Amsterdam" not in query
+        assert "Utrecht" not in query
+        assert "Eindhoven" not in query
+        assert "Remote" not in query
+    germany = clean_conditions(["Senior"], ["Full-time"], [], "Germany", "")
+    abroad = _search_queries(roles, germany, skills[:2])
+    assert abroad
+    assert all("vacature" not in query for query in abroad)
+    assert all("Senior" not in query and "Full-time" not in query for query in abroad)
+    city = clean_conditions([], [], ["Hybrid"], "Netherlands", "Delft")
+    placed = _search_queries(roles, city, skills[:2])
+    assert any("Delft" in query and "Hybrid" in query for query in placed)
+    assert all("Amsterdam" not in query for query in placed)
+
+
+def test_removed_links_stay_out_and_a_later_stop_keeps_saved_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from career_copilot.job_list import _search_prompt
+
     prompt = _search_prompt(
         _roles(),
         clean_conditions([], [], [], "", ""),
         ["Neo4j"],
         skipped=["https://example.com/jobs/old", "paste:secret:pasted"],
-        again=True,
     )
     assert "https://example.com/jobs/old" in prompt
     assert "paste:secret" not in prompt
@@ -2165,16 +2241,23 @@ def test_removed_links_are_left_out_and_the_search_asks_again(tmp_path: Path, mo
     assert "SECRET CURRICULUM" not in hidden
     assert "Do not put the CV into the web search." in hidden
     assert "Do not return these links:" in prompt
-    assert "Return different open pages." in prompt
-    old = _web_opening("https://example.com/jobs/old", "Remote Neo4j researcher role. " * 8, workplace="Remote")
-    new = _web_opening("https://example.com/jobs/new", "Remote Neo4j researcher role. " * 8, workplace="Remote")
-    calls: list[bool] = []
+    assert "Do not score the CV." in prompt
+    page = "Remote Neo4j researcher role. " * 12
+    calls: list[int] = []
 
-    def fake(*_args, **kwargs):
-        calls.append(bool(kwargs.get("again")))
-        return [old] if not kwargs.get("again") else [new]
+    def links(_query: str, _conditions, *, skipped, timeout_seconds: int, cv_text: str = ""):
+        calls.append(timeout_seconds)
+        assert "https://example.com/jobs/old" in skipped
+        assert "SECRET" not in cv_text or "SECRET CURRICULUM" not in _query
+        if len(calls) == 1:
+            return [
+                {"title": "Old", "company": "Lab", "url": "https://example.com/jobs/old"},
+                {"title": "Researcher", "company": "Lab", "url": "https://example.com/jobs/new"},
+            ]
+        raise CareerCopilotError("Grok took too long. Nothing was saved.")
 
-    monkeypatch.setattr("career_copilot.job_list._discover_with_grok", fake)
+    monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
+    monkeypatch.setattr("career_copilot.job_list.fetch_posting", lambda _url: page)
     path = tmp_path / "jobs.json"
     save_log(SearchLog(skipped_urls=["https://example.com/jobs/old"]), path)
     outcome = real_search(
@@ -2186,24 +2269,24 @@ def test_removed_links_are_left_out_and_the_search_asks_again(tmp_path: Path, mo
         path=path,
         require_grok=False,
     )
-    assert calls == [False, True]
+    assert len(calls) >= 2
     assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new"]
     assert outcome.skipped_urls == ["https://example.com/jobs/old"]
+    assert outcome.reason == ""
 
 
-def test_a_search_that_does_not_answer_is_tried_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    page = _web_opening("https://example.com/jobs/new", "Remote Neo4j researcher role. " * 8, workplace="Remote")
-    calls: list[bool] = []
+def test_a_query_that_does_not_answer_keeps_a_later_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = "Remote Neo4j researcher role. " * 12
+    calls: list[int] = []
 
-    def fake(*_args, **kwargs):
-        calls.append(bool(kwargs.get("again")))
-        if not kwargs.get("again"):
-            raise CareerCopilotError(
-                "Grok did not return a search. Stay signed in with grok login and try again."
-            )
-        return [page]
+    def links(_query: str, _conditions, *, skipped, timeout_seconds: int, cv_text: str = ""):
+        calls.append(1)
+        if len(calls) == 1:
+            raise CareerCopilotError("Grok did not return a search. Stay signed in with grok login and try again.")
+        return [{"title": "Researcher", "company": "Lab", "url": "https://example.com/jobs/new"}]
 
-    monkeypatch.setattr("career_copilot.job_list._discover_with_grok", fake)
+    monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
+    monkeypatch.setattr("career_copilot.job_list.fetch_posting", lambda _url: page)
     outcome = real_search(
         "Neo4j researcher",
         _roles(),
@@ -2213,8 +2296,26 @@ def test_a_search_that_does_not_answer_is_tried_again(tmp_path: Path, monkeypatc
         path=tmp_path / "jobs.json",
         require_grok=False,
     )
-    assert calls == [False, True]
+    assert len(calls) >= 2
     assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new"]
+
+
+def test_a_search_with_no_saved_link_reports_nothing_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    def links(_query: str, _conditions, *, skipped, timeout_seconds: int, cv_text: str = ""):
+        raise CareerCopilotError("Grok took too long. Nothing was saved.")
+
+    monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
+    outcome = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        skills=["Neo4j"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    assert outcome.latest == []
+    assert outcome.reason == "Nada foi encontrado."
 
 
 def test_opening_pages_stops_when_the_score_needs_the_remaining_time():
