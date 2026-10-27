@@ -28,7 +28,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from career_copilot.errors import CareerCopilotError
-from career_copilot.roles import WorkRole, child_env, grok_score_argv, grok_search_argv
+from career_copilot.roles import FAST_MODEL, WorkRole, child_env, grok_score_argv, grok_search_argv
 from career_copilot.search_intent import SearchConditions
 
 HIGH_MATCH = 70
@@ -37,11 +37,11 @@ MAX_SCORED = 5
 MAX_FETCHED = 12
 WEB_SCORED = 4
 WEB_SHOWN = 3
-SEARCH_TIMEOUT_SECONDS = 240
+SEARCH_TIMEOUT_SECONDS = 360
 _SCORE_RESERVE_SECONDS = 40
 _QUERY_LIMIT = 4
-_QUERY_TIMEOUT_SECONDS = 60
-_OPEN_FLOOR_SECONDS = 70
+_QUERY_TIMEOUT_SECONDS = 90
+_OPEN_FLOOR_SECONDS = 90
 FALLBACK_REASON = "Nada foi encontrado, então retornamos a vaga com o maior match com o seu CV."
 EMPTY_REASON = "Nada foi encontrado."
 DEADLINE_NOTE = "The application deadline was not found."
@@ -655,6 +655,7 @@ def _search_web(
             progress=progress,
             skipped=removed,
             time_left=remaining,
+            note_path=path,
         )
     candidates = usable(found_pages)
     traits = load_traits(traits_for_jobs(path))
@@ -1688,12 +1689,13 @@ def _search_queries(roles: list[WorkRole], conditions: SearchConditions, skills:
     first = [part for part in (_or_group(lead), _or_group(role_group), _or_group(place), _or_group(["job", "vacancy", "apply now"])) if part]
     add(" ".join(first))
     if role_names:
-        add(f"{_or_join(role_names)} {_or_join(place)}".strip())
+        second = [part for part in (_or_group(role_names), _or_group(["job", "vacancy"]), _or_group(place)) if part]
+        add(" ".join(second))
     focus = skill_names[:2] or role_names[:1]
     workplaces = list(conditions.workplaces)
     if netherlands and any(item.casefold() == "hybrid" for item in workplaces):
         workplaces.append("hybride")
-    third = [part for part in (_or_join(focus), _or_join(listing), _or_group(workplaces)) if part]
+    third = [part for part in (_or_group(focus), _or_group(listing), _or_group(workplaces)) if part]
     if conditions.country.strip():
         third.append(conditions.country.strip())
     elif conditions.city.strip():
@@ -1718,6 +1720,7 @@ def _discover_with_grok(
     progress: Callable[[str], None] | None = None,
     skipped: list[str] | None = None,
     time_left: Callable[[], int] | None = None,
+    note_path: Path | None = None,
 ) -> list[_Opening]:
     clock = time_left or (lambda: SEARCH_TIMEOUT_SECONDS)
     items = _collect_search_links(
@@ -1728,6 +1731,7 @@ def _discover_with_grok(
         skipped=skipped,
         time_left=clock,
         progress=progress,
+        note_path=note_path,
     )
     return openings_from_search(
         items,
@@ -1747,6 +1751,7 @@ def _collect_search_links(
     skipped: list[str] | None,
     time_left: Callable[[], int],
     progress: Callable[[str], None] | None,
+    note_path: Path | None = None,
 ) -> list[dict[str, object]]:
     queries = _search_queries(roles, conditions, skills)
     saved: list[dict[str, object]] = []
@@ -1754,12 +1759,15 @@ def _collect_search_links(
     timed_out = False
     failed = False
     total = len(queries)
+    note = [f"model: {FAST_MODEL}"]
+    note.extend(f"query {index}: {query}" for index, query in enumerate(queries, start=1))
+    _write_search_note(note_path, note)
     for index, query in enumerate(queries, start=1):
         budget = _query_budget(time_left())
         if budget < 1:
             break
         if progress is not None:
-            progress(f"Searching {index} of {total}.")
+            progress(f"Searching {index} of {total} with {FAST_MODEL}.")
         try:
             found = _links_for_query(
                 query,
@@ -1770,13 +1778,25 @@ def _collect_search_links(
             )
         except CareerCopilotError as exc:
             message = str(exc).casefold()
+            if "fast model" in message:
+                note.append(f"query {index}: the fast model was not used")
+                _write_search_note(note_path, note)
+                if progress is not None:
+                    progress("That call did not use the fast model. Continuing.")
+                continue
             if "too long" in message:
                 timed_out = True
+                note.append(f"query {index}: stopped before it returned")
+                _write_search_note(note_path, note)
                 continue
             if "did not return a search" in message:
                 failed = True
+                note.append(f"query {index}: no search result")
+                _write_search_note(note_path, note)
                 continue
             raise
+        note.append(f"query {index} links: {len(found)}")
+        _write_search_note(note_path, note)
         for item in found:
             url = str(item.get("url", ""))
             if url in seen:
@@ -1824,19 +1844,19 @@ def _links_for_query(
             if isinstance(late, bytes):
                 late = late.decode("utf-8", errors="replace")
             if not str(late).strip():
-                return []
+                raise CareerCopilotError("Grok took too long. Nothing was saved.") from exc
             completed = subprocess.CompletedProcess(
                 grok_search_argv(executable, prompt_file, directory),
                 0,
                 stdout=str(late),
                 stderr="",
             )
+    stdout = completed.stdout or ""
+    if stdout.strip() and not _fast_model_used(stdout):
+        raise CareerCopilotError("The fast model was not used.")
     found: list[dict[str, object]] = []
-    if (completed.stdout or "").strip():
-        try:
-            found = _parse_search_jobs(completed.stdout or "")
-        except CareerCopilotError:
-            found = []
+    if stdout.strip():
+        found = _parse_search_jobs(stdout)
     if completed.returncode != 0 and not found:
         raise CareerCopilotError("Grok did not return a search. Stay signed in with grok login and try again.")
     avoided = {url for url in (skipped or []) if url.startswith("https://")}
@@ -1873,9 +1893,9 @@ def _query_prompt(
         "Use one web search for the query below, then stop and return the JSON.",
         "Do not open the pages. Do not run a second search.",
         "A blank field is not a preference. Do not add a place, a workplace, or a year that is not listed.",
-        "Return only JSON:",
-        '{"jobs":[{"title":"role","company":"employer","url":"https://example.com/job"}]}',
+        "Return only a JSON object with a jobs list.",
         "Each item needs a title, a company, and one https url from the search results.",
+        "Do not copy an example link.",
         "Rules:",
         "- Use an https link to the employer or another public job page.",
         "- Do not use LinkedIn.",
@@ -1897,31 +1917,95 @@ def _query_prompt(
     return "\n".join(lines) + "\n"
 
 
-def _parse_search_jobs(stdout: str) -> list[dict[str, object]]:
-    from career_copilot.roles import _json_object
+def _write_search_note(path: Path | None, lines: list[str]) -> None:
+    """Queries and model id only. The CV is not written here."""
 
-    bodies: list[object] = []
+    target = (jobs_path() if path is None else path).parent / "search-run.txt"
     try:
-        body = _json_object(stdout)
-    except CareerCopilotError:
-        body = None
-    if isinstance(body, dict):
-        bodies.append(body)
-        text = body.get("text")
-        if isinstance(text, str) and "jobs" not in body:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        return
+
+
+def _fast_model_used(stdout: str) -> bool:
+    """A reply with no model record is kept. A reply from another model is not."""
+
+    for item in _json_values(stdout):
+        if isinstance(item, dict) and isinstance(item.get("modelUsage"), dict) and item["modelUsage"]:
+            return FAST_MODEL in item["modelUsage"]
+    return True
+
+
+def _json_values(text: str) -> list[object]:
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = raw.removeprefix("```json").removeprefix("```").strip()
+        if raw.endswith("```"):
+            raw = raw[: raw.rfind("```")].strip()
+    decoder = json.JSONDecoder()
+    found: list[object] = []
+    index = 0
+    while index < len(raw):
+        starts = [point for point in (raw.find("{", index), raw.find("[", index)) if point >= 0]
+        if not starts:
+            break
+        start = min(starts)
+        try:
+            value, offset = decoder.raw_decode(raw, start)
+        except json.JSONDecodeError:
+            repaired = re.sub(r",\s*([}\]])", r"\1", raw[start:])
             try:
-                bodies.append(_json_object(text))
-            except CareerCopilotError:
-                bodies.append(text)
+                value, offset = decoder.raw_decode(repaired, 0)
+            except json.JSONDecodeError:
+                index = start + 1
+                continue
+            found.append(value)
+            index = start + offset
+            continue
+        found.append(value)
+        index = offset
+    return found
+
+
+def _jobs_in(value: object) -> list[dict[str, object]]:
     found: list[dict[str, object]] = []
-    for item in bodies:
-        if isinstance(item, dict) and isinstance(item.get("jobs"), list):
-            found.extend(job for job in item["jobs"] if isinstance(job, dict))
-        elif isinstance(item, str):
-            found.extend(_jobs_from_text(item))
-    if found:
-        return found
-    return _jobs_from_text(stdout)
+    if isinstance(value, dict):
+        jobs = value.get("jobs")
+        if isinstance(jobs, list):
+            found.extend(job for job in jobs if isinstance(job, dict))
+        text = value.get("text")
+        if isinstance(text, str) and not isinstance(jobs, list):
+            inner = _json_values(text)
+            if inner:
+                for item in inner:
+                    found.extend(_jobs_in(item))
+            else:
+                found.extend(_jobs_from_text(text))
+    elif isinstance(value, list):
+        found.extend(job for job in value if isinstance(job, dict))
+    return found
+
+
+def _parse_search_jobs(stdout: str) -> list[dict[str, object]]:
+    found: list[dict[str, object]] = []
+    for value in _json_values(stdout):
+        found.extend(_jobs_in(value))
+    if not found:
+        found.extend(_jobs_from_text(stdout))
+    kept: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for job in found:
+        url = str(job.get("url", "")).strip()
+        host = (urllib.parse.urlparse(url).hostname or "").casefold()
+        if host == "example.com" or host.endswith(".example.com"):
+            continue
+        if url and url in seen:
+            continue
+        if url:
+            seen.add(url)
+        kept.append(job)
+    return kept
 
 
 def _jobs_from_text(text: str) -> list[dict[str, object]]:

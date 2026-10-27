@@ -82,6 +82,8 @@ def test_child_env_and_argv_do_not_carry_a_key():
     search = grok_search_argv("grok", Path("prompt.txt"), Path("."))
     assert search[search.index("--max-turns") + 1] == "2"
     assert search[search.index("--model") + 1] == "grok-4.7-build-fast"
+    assert "jobs" in search[search.index("--json-schema") + 1]
+    assert "--json-schema" not in argv
     assert "--always-approve" in search
     assert "web_search" not in search[search.index("--disallowed-tools") + 1]
     assert "web_fetch" not in search[search.index("--disallowed-tools") + 1]

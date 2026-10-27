@@ -1171,7 +1171,7 @@ def _web_opening(url: str, text: str, *, title: str = "Knowledge Graph Engineer"
 
 
 def test_web_search_stops_at_three_and_keeps_four_minutes():
-    assert SEARCH_TIMEOUT_SECONDS == 240
+    assert SEARCH_TIMEOUT_SECONDS == 360
     assert WEB_SHOWN == 3
 
 
@@ -2172,14 +2172,47 @@ def test_a_search_reply_keeps_real_links_and_drops_linkedin():
         }
     )
     assert _parse_search_jobs(wrapped)[0]["url"] == "https://jobs.example.org/1"
+    broken = json.dumps(
+        {
+            "text": '{"jobs":[{"title":"Engineer","company":"Lab","url":"https://jobs.example.org/x",}]}',
+            "modelUsage": {"grok-4.7-build-fast": {"modelCalls": 1}},
+        }
+    )
+    repaired = _parse_search_jobs(broken)
+    assert repaired[0]["title"] == "Engineer"
+    assert repaired[0]["url"] == "https://jobs.example.org/x"
+    from career_copilot.job_list import _fast_model_used
+
+    assert _fast_model_used(broken) is True
+    high = json.dumps(
+        {
+            "text": '{"jobs":[{"title":"A","company":"B","url":"https://jobs.example.org/a"}]}',
+            "modelUsage": {"grok-4.7-build": {"modelCalls": 1}},
+        }
+    )
+    assert _fast_model_used(high) is False
+    assert _fast_model_used('{"jobs":[]}') is True
+    copied = json.dumps(
+        {
+            "text": (
+                '{"jobs":[{"title":"role","company":"employer","url":"https://example.com/job"}]}'
+                '{"jobs":[{"title":"Engineer","company":"CGI","url":"https://www.wizbii.com/company/cgi/job/1"}]}'
+            ),
+            "modelUsage": {"grok-4.7-build-fast": {"modelCalls": 1}},
+        }
+    )
+    copied_jobs = _parse_search_jobs(copied)
+    assert [(item["title"], item["url"]) for item in copied_jobs] == [
+        ("Engineer", "https://www.wizbii.com/company/cgi/job/1")
+    ]
 
 
 def test_short_queries_use_saved_roles_skills_and_the_filled_place():
     from career_copilot.job_list import _query_budget, _search_queries
 
-    assert _query_budget(240) == 60
-    assert _query_budget(80) == 10
-    assert _query_budget(70) == 0
+    assert _query_budget(360) == 90
+    assert _query_budget(100) == 10
+    assert _query_budget(90) == 0
     roles = [
         WorkRole(name="knowledge engineer", reason="The work is knowledge."),
         WorkRole(name="researcher", reason="The work is research."),
@@ -2209,6 +2242,7 @@ def test_short_queries_use_saved_roles_skills_and_the_filled_place():
     assert "vacature" in joined
     assert "apply now" in queries[0]
     assert "job" in queries[0] and "vacancy" in queries[0]
+    assert all("job" in query or "vacature" in query for query in queries)
     for query in queries:
         assert "2026" not in query
         assert "Amsterdam" not in query
@@ -2224,6 +2258,36 @@ def test_short_queries_use_saved_roles_skills_and_the_filled_place():
     placed = _search_queries(roles, city, skills[:2])
     assert any("Delft" in query and "Hybrid" in query for query in placed)
     assert all("Amsterdam" not in query for query in placed)
+
+
+def test_a_high_model_call_is_skipped_and_the_note_omits_the_cv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    page = "Remote Neo4j researcher role. " * 12
+    calls: list[str] = []
+
+    def links(query: str, _conditions, *, skipped, timeout_seconds: int, cv_text: str = "") -> list[dict[str, str]]:
+        calls.append(query)
+        if len(calls) == 1:
+            raise CareerCopilotError("The fast model was not used.")
+        return [{"title": "Researcher", "company": "Lab", "url": "https://example.com/jobs/new"}]
+
+    monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
+    monkeypatch.setattr("career_copilot.job_list.fetch_posting", lambda _url: page)
+    path = tmp_path / "jobs.json"
+    outcome = real_search(
+        "Neo4j researcher SECRETLINE",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        skills=["Neo4j"],
+        path=path,
+        require_grok=False,
+    )
+    note = (tmp_path / "search-run.txt").read_text(encoding="utf-8")
+    assert "grok-4.7-build-fast" in note
+    assert "query 1:" in note
+    assert "the fast model was not used" in note
+    assert "SECRETLINE" not in note
+    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new"]
 
 
 def test_removed_links_stay_out_and_a_later_stop_keeps_saved_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

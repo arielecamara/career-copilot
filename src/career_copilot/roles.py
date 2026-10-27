@@ -258,6 +258,11 @@ def grok_argv(executable: str, prompt_file: Path, cwd: Path) -> list[str]:
 
 
 FAST_MODEL = "grok-4.7-build-fast"
+SEARCH_JOBS_SCHEMA = (
+    '{"type":"object","properties":{"jobs":{"type":"array","items":{"type":"object",'
+    '"properties":{"title":{"type":"string"},"company":{"type":"string"},"url":{"type":"string"}},'
+    '"required":["title","company","url"]}}},"required":["jobs"]}'
+)
 
 
 def grok_search_argv(executable: str, prompt_file: Path, cwd: Path) -> list[str]:
@@ -268,6 +273,8 @@ def grok_search_argv(executable: str, prompt_file: Path, cwd: Path) -> list[str]
         "--verbatim",
         "--output-format",
         "json",
+        "--json-schema",
+        SEARCH_JOBS_SCHEMA,
         "--model",
         FAST_MODEL,
         "--max-turns",
