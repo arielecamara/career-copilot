@@ -53,6 +53,7 @@ from career_copilot.job_list import (
     requested_documents,
     score_posting,
     short_line,
+    REQUIREMENTS_NOTE,
     UNSCORED_NOTE,
     visible_jobs,
 )
@@ -560,7 +561,7 @@ def _possible_block(st, job: ListedJob, prefix: str) -> None:
 
 def _match_label(job: ListedJob) -> str:
     judged = job.covered or job.partial or job.missing or job.assumed
-    if UNSCORED_NOTE in job.notes and not judged:
+    if REQUIREMENTS_NOTE in job.notes or (UNSCORED_NOTE in job.notes and not judged):
         return "Not scored"
     return f"{job.match_percent}%"
 

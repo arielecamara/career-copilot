@@ -27,9 +27,10 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from career_copilot.errors import CareerCopilotError
+from career_copilot.esco import labels_for
 from career_copilot.roles import FAST_MODEL, WorkRole, child_env, grok_score_argv, grok_search_argv
 from career_copilot.search_intent import SearchConditions
-from career_copilot.vocab import looks_like_heading, normalize_heading, skill_named_in
+from career_copilot.vocab import classify_heading, looks_like_heading, normalize_heading, skill_named_in
 
 HIGH_MATCH = 70
 MIN_MATCH = 50
@@ -42,6 +43,7 @@ _POSSIBLE_CAP = 8
 FALLBACK_REASON = "Nada foi encontrado, então retornamos a vaga com o maior match com o seu CV."
 EMPTY_REASON = "Nada foi encontrado."
 UNSCORED_NOTE = "The match was not scored."
+REQUIREMENTS_NOTE = "The requirements section was not found."
 DEADLINE_NOTE = "The application deadline was not found."
 _POSTING_CAP = 8000
 _FETCH_CAP = 24000
@@ -103,6 +105,7 @@ class MatchPoint(BaseModel):
     text: str
     status: str
     basis: str = ""
+    weight: int = 1
 
     @field_validator("text", "basis")
     @classmethod
@@ -180,6 +183,7 @@ class ListedJob(BaseModel):
     assumed: list[AssumedPoint] = Field(default_factory=list)
     answered: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    weights: dict[str, int] = Field(default_factory=dict)
 
     @field_validator("notes")
     @classmethod
@@ -290,12 +294,6 @@ def revise_job(job: ListedJob, ask: str, basis: str, vote: str | None) -> Listed
     elif vote == "down":
         if in_missing and in_answered:
             return job
-        posting_term = any(
-            _same_line(item.ask, cleaned_ask) and _same_line(item.basis, item.ask)
-            for item in job.assumed
-        )
-        if posting_term:
-            destination = "out"
         elif (
             cleaned_basis.casefold() == cleaned_ask.casefold()
             and in_answered
@@ -395,9 +393,16 @@ def _without_line(lines: list[str], ask: str) -> list[str]:
 
 
 def _points_of(job: ListedJob) -> list[MatchPoint]:
-    points = [MatchPoint(text=line, status="match") for line in job.covered]
-    points.extend(MatchPoint(text=line, status="partial") for line in job.partial)
-    points.extend(MatchPoint(text=line, status="no_match") for line in job.missing)
+    def point(line: str, status: str) -> MatchPoint:
+        return MatchPoint(text=line, status=status, weight=job.weights.get(line, 1))
+
+    points = [point(line, "match") for line in job.covered]
+    points.extend(point(line, "partial") for line in job.partial)
+    points.extend(point(line, "no_match") for line in job.missing)
+    points.extend(
+        MatchPoint(text=item.ask, status="assumed", basis=item.basis, weight=job.weights.get(item.ask, 1))
+        for item in job.assumed
+    )
     return points
 
 
@@ -492,16 +497,23 @@ def drop_job(job: ListedJob, path: Path | None = None) -> None:
 
 
 def match_percent(points: list[MatchPoint]) -> int | None:
-    judged = [point for point in points if point.status not in {"unknown", "assumed"}]
+    """Matches over matches, gaps, and unanswered possible matches."""
+
+    judged = [point for point in points if point.status != "unknown"]
     if not judged:
         return None
+    total = 0
     score = 0.0
     for point in judged:
+        weight = point.weight if point.weight > 0 else 1
+        total += weight
         if point.status == "match":
-            score += 1
+            score += weight
         elif point.status == "partial":
-            score += 0.5
-    return round(100 * score / len(judged))
+            score += weight / 2
+    if total == 0:
+        return None
+    return round(100 * score / total)
 
 
 def is_open(closes_on: date | None, today: date) -> bool:
@@ -637,7 +649,7 @@ def real_search(
 
 def _web_quick_match(job: ListedJob) -> bool:
     judged = bool(job.covered or job.partial or job.missing or job.assumed)
-    return job.source == "Web" and judged
+    return job.source == "Web" and (judged or job.match_percent == 0)
 
 
 def _unscored(job: ListedJob) -> bool:
@@ -676,6 +688,7 @@ def _search_web(
             roles,
             skills,
             traits,
+            company=opening.company,
         )
         if best is None or percent > best[0]:
             best = (percent, opening, points)
@@ -838,13 +851,27 @@ def _quick_match(
     roles: list[WorkRole],
     skills: list[str],
     traits: list[Trait] | None = None,
+    company: str = "",
 ) -> tuple[int, list[MatchPoint]]:
+    section = _profile_text(posting)
+    title = posting.splitlines()[0] if posting.splitlines() else ""
     terms = _quick_terms(cv_text, roles, skills)
+    if not section.strip():
+        points = [
+            MatchPoint(text=term, status="match", weight=2)
+            for term in terms
+            if _term_in_text(title, term)
+        ]
+        return 0, points
+    scope = f"{title}\n{section}"
     points = [
-        MatchPoint(text=term, status="match" if _term_in_text(posting, term) else "no_match")
+        MatchPoint(text=term, status="match", weight=2)
         for term in terms
+        if _term_in_text(scope, term)
     ]
-    points = _attach_possible_terms(points, cv_text, posting, traits or [])
+    points = _attach_possible_terms(
+        points, cv_text, posting, traits or [], record_gaps=False, company=company
+    )
     return match_percent(points) or 0, points
 
 
@@ -867,6 +894,8 @@ _HARD_STOP = {
     "preferred", "required", "nice", "bonus", "skill", "skills", "ability", "abilities", "strong",
     "excellent", "good", "great", "proven", "solid", "background", "degree", "diploma", "university",
     "college", "looking", "join", "joining", "seeking", "wanted", "welcome", "description", "profile",
+    "innovation", "innovative", "passion", "passionate", "dynamic", "exciting", "impact",
+    "growth", "grow", "unique", "amazing", "opportunity",
     "duties", "duty", "task", "tasks", "culture", "equal", "employer", "employment", "hour", "hours",
     "week", "weeks", "month", "months", "day", "days", "time", "based", "level", "full", "part",
     "contract", "permanent", "temporary", "freelance", "internship", "please", "note", "build",
@@ -906,6 +935,7 @@ _DEGREES = {"phd", "ph.d", "bsc", "msc", "mba", "ba", "ma", "md", "jd", "beng", 
 _ORDINARY_ACRONYMS = _DEGREES | {
     "cv", "id", "eu", "us", "uk", "hr", "am", "pm", "ok", "pdf", "url", "na", "tbd", "asap",
     "fyi", "faq", "eta", "diy", "nl", "en", "fr", "de", "es", "pt", "pl", "sv", "da",
+    "eur", "usd", "gbp", "brl", "chf",
     "and", "or", "the", "for", "with", "from", "your", "our", "you", "we", "are", "was", "has",
     "had", "not", "but", "all", "any", "can", "may", "must", "will", "who", "how", "what",
     "when", "where", "why", "this", "that", "they", "them", "their", "about", "into", "over",
@@ -922,6 +952,14 @@ _HYPHEN_BOILER = {
     "well-rounded", "year-round", "up-to-date", "all-round", "follow-up",
 }
 _DOTTED_STOP = {"e.g", "i.e", "ph.d", "u.s", "u.k", "a.m", "p.m", "dr", "mr", "mrs", "ms", "prof", "etc"}
+_SITE_NAMES = {
+    "linkedin", "indeed", "glassdoor", "monster", "ziprecruiter", "facebook", "instagram",
+    "twitter", "youtube", "wikipedia", "stackoverflow", "reddit", "medium", "example",
+}
+_EXPERIENCE_YEARS = re.compile(
+    r"\b(\d{1,2})\s*(\+|-\s*\d{1,2})?\s*(years?|yrs?)\b",
+    re.IGNORECASE,
+)
 _CUE_WORDS = {"with", "using", "use", "uses", "used", "including", "include", "includes", "plus", "via"}
 _CONTINUATIONS = {"and", "or"}
 _TRANSPARENT = {
@@ -998,6 +1036,7 @@ def _blocked_term(token: str) -> bool:
         or key in _DEGREES
         or key in _ORDINARY_ACRONYMS
         or key in _HYPHEN_BOILER
+        or key in _SITE_NAMES
     )
 
 
@@ -1018,11 +1057,23 @@ def _is_camel(token: str) -> bool:
     return bool(token) and token[0].isalpha() and any(char.isupper() for char in token[1:]) and any(char.islower() for char in token)
 
 
+def _urlish(token: str) -> bool:
+    if "://" in token or token.casefold().startswith("www."):
+        return True
+    if "/" in token:
+        parts = [part for part in token.split("/") if part]
+        return not (len(parts) == 2 and all(part.isalpha() and len(part) <= 4 for part in parts))
+    parts = token.split(".")
+    if len(parts) >= 2 and all(len(part) >= 3 for part in parts):
+        return True
+    return False
+
+
 def _strong_token(token: str) -> bool:
     """Acronyms, digits, symbols, camel case, and hyphenated technical tokens."""
 
     key = token.casefold()
-    if _blocked_term(token) or key in _DOTTED_STOP:
+    if _urlish(token) or _blocked_term(token) or key in _DOTTED_STOP:
         return False
     if _is_acronym(token):
         return True
@@ -1042,7 +1093,14 @@ def _phrase_word(token: str) -> bool:
     if re.fullmatch(r"[A-Z][a-z]{2,}", token) is None:
         return False
     key = token.casefold()
-    return key not in _HARD_STOP and key not in _ROLE_WORDS and key not in _PLACES and key not in _MONTHS and key not in _LANGUAGES
+    return (
+        key not in _HARD_STOP
+        and key not in _ROLE_WORDS
+        and key not in _PLACES
+        and key not in _MONTHS
+        and key not in _LANGUAGES
+        and key not in _SITE_NAMES
+    )
 
 
 def _phrase_end(line: str, tokens: list[re.Match[str]], start: int) -> int | None:
@@ -1055,6 +1113,9 @@ def _phrase_end(line: str, tokens: list[re.Match[str]], start: int) -> int | Non
             break
         end += 1
     if end - start < 2:
+        return None
+    words = [tokens[item].group(0) for item in range(start, end)]
+    if all(_strong_token(word) or _single_candidate(word) for word in words):
         return None
     return end
 
@@ -1154,6 +1215,128 @@ def _line_terms(line: str, offset: int) -> list[tuple[int, int, str]]:
     return found
 
 
+_PROFILE_STEMS = (
+    "requirement", "qualification", "skills", "skill", "competenc", "must have",
+    "your profile", "jouw profiel", "je profiel", "uw profiel", "gewenst profiel",
+    "het profiel", "what you bring", "wat breng je mee", "wat je meebrengt",
+    "wat neem je mee", "wat wij vragen", "wat we vragen", "wie ben jij", "wie zoeken",
+    "functie eisen", "functievereisten", "vereisten", "technical skills",
+    "required skills", "ce que vous apportez", "profil recherche", "votre profil",
+    "competences requises", "what you need", "who you are", "requisito", "qualific",
+    "habilidad", "perfil", "vaardig", "competenties",
+)
+_NICE_STEMS = (
+    "nice to have", "preferred", "bonus", "good to have", "would be a plus", "advantage",
+)
+_STOP_STEMS = (
+    "about us", "about the", "who we are", "benefit", "we offer", "our offer",
+    "what we offer", "salary", "compensation", "culture", "how to apply",
+    "responsibilit", "what you will do", "what you'll do", "the role",
+    "job description", "our mission", "why join", "what we do", "over ons",
+    "wij bieden", "wat bieden", "arbeidsvoorwaarden", "gerelateerde vacatures",
+    "andere vacatures", "andere functies", "similar jobs", "other jobs",
+    "sollicitatie", "recruitment process", "over het bedrijf", "deadline", "location",
+)
+_NEXT_HEADING_WORDS = (
+    "bieden", "aanbod", "vacature", "vacatures", "gerelateerd", "arbeidsvoorwaarden",
+    "benefit", "offer", "about", "team", "sollicitatie", "procedure", "locatie",
+    "salaris", "salary", "culture", "company", "functies", "jobs", "process",
+)
+
+
+def _heading_kind(line: str) -> str | None:
+    """Profile sections describe the desired person. Other short headings end that section."""
+
+    cleaned = line.strip().lstrip("#-*•").strip().rstrip(":").strip()
+    if not cleaned or len(cleaned) > 60 or cleaned.endswith((".", "!", "?")):
+        return None
+    if len(cleaned.split()) > 8:
+        return None
+    folded = normalize_heading(cleaned)
+    if not folded:
+        return None
+    if any(stem in folded for stem in _STOP_STEMS):
+        return "stop"
+    if any(stem in folded for stem in _NICE_STEMS):
+        return "nice"
+    if any(stem in folded for stem in _PROFILE_STEMS):
+        return "profile"
+    if looks_like_heading(cleaned):
+        section = classify_heading(cleaned)
+        if section is not None and section.value == "skills":
+            return "profile"
+        return "stop"
+    return None
+
+
+def _other_heading(line: str) -> bool:
+    """A later section title. Skill bullets and tool names are not headings."""
+
+    raw = line.strip()
+    if not raw or raw.startswith(("-", "*", "•")):
+        return False
+    if raw.startswith("#"):
+        return _heading_kind(raw.lstrip("#").strip()) not in {"profile", "nice"}
+    if "," in raw or raw.endswith((".", "!", "?")):
+        return False
+    cleaned = raw.rstrip(":").strip()
+    words = cleaned.split()
+    if not 2 <= len(words) <= 6 or len(cleaned) > 48:
+        return False
+    if all(_strong_token(word.strip(",")) for word in words):
+        return False
+    folded = normalize_heading(cleaned)
+    return any(word in folded for word in _NEXT_HEADING_WORDS)
+
+
+def _profile_parts(posting: str) -> list[tuple[int, str]]:
+    """Requirement text with weight 2 for essential lines and 1 for nice-to-have."""
+
+    lines = posting.splitlines() or [posting]
+    parts: list[tuple[int, list[str]]] = []
+    current: list[str] | None = None
+    weight = 2
+    saw = False
+    for line in lines:
+        kind = _heading_kind(line)
+        if kind in {"profile", "nice"}:
+            if current:
+                parts.append((weight, current))
+            current = []
+            weight = 1 if kind == "nice" else 2
+            saw = True
+            continue
+        if kind == "stop" or (current is not None and _other_heading(line)):
+            if current:
+                parts.append((weight, current))
+            current = None
+            continue
+        if current is not None:
+            current.append(line)
+    if current:
+        parts.append((weight, current))
+    if saw:
+        return [(item_weight, "\n".join(text)) for item_weight, text in parts if any(line.strip() for line in text)]
+    return []
+
+
+def _profile_text(posting: str) -> str:
+    """Text of the sections that describe the desired profile."""
+
+    return "\n".join(text for _weight, text in _profile_parts(posting))
+
+
+def _partial_overlap(term: str, cv_text: str) -> bool:
+    """True when some words of a phrase are in the CV and the whole phrase is not."""
+
+    if _clearly_written(term, cv_text):
+        return False
+    words = [word for word in _fold_phrase(term) if len(word) >= 5]
+    if len(words) < 2:
+        return False
+    return any(_term_in_text(cv_text, word) for word in words)
+
+
 def _technical_terms(posting: str) -> list[tuple[int, int, str]]:
     """Technical terms from the posting, strongest first, then document order."""
 
@@ -1175,6 +1358,72 @@ def _technical_terms(posting: str) -> list[tuple[int, int, str]]:
     return sorted(best.values(), key=lambda item: (item[0], item[1]))
 
 
+def _line_concept(line: str) -> str | None:
+    """A short line of title-case words is one concept, not a list of tools."""
+
+    cleaned = line.strip().lstrip("-*•").strip().rstrip(".").strip()
+    words = [word.strip(",") for word in cleaned.split()]
+    if not 2 <= len(words) <= 4:
+        return None
+    if not all(re.fullmatch(r"[A-Za-z][A-Za-z-]{2,}", word) for word in words):
+        return None
+    for word in words:
+        key = word.casefold()
+        if key in _HARD_STOP or key in _ROLE_WORDS or key in _SITE_NAMES or key in _MONTHS or key in _LANGUAGES:
+            return None
+    return " ".join(words)
+
+
+_GENERIC_WORDS = {
+    "object", "oriented", "integration", "integrations", "migration", "migrations",
+    "met", "van", "voor", "ervaring", "min", "minimaal", "jaren", "jaar",
+    "with", "and", "the", "for", "your", "our", "you", "experience",
+}
+
+
+def _version_token(term: str) -> bool:
+    return re.fullmatch(r"v?\d[\w.+-]*", term, re.IGNORECASE) is not None
+
+
+def _skill_shaped(term: str) -> bool:
+    """An acronym, a hyphenated term, CamelCase, or a short product name."""
+
+    if not term.strip() or _version_token(term):
+        return False
+    if any(word.casefold() in _GENERIC_WORDS for word in re.split(r"[\s-]+", term) if word):
+        if "-" not in term:
+            return False
+    return " " not in term and (_is_acronym(term) or _is_camel(term) or _is_hyphenated(term) or _strong_token(term))
+
+
+def _is_named_tool(term: str) -> bool:
+    """A technology or tool name. It is not a concept phrase."""
+
+    words = [word for word in term.split() if word]
+    if not words:
+        return False
+    return all(_named_tool_word(word) for word in words)
+
+
+def _named_tool_word(word: str) -> bool:
+    if word.casefold() in _WEAK_WORDS or word.casefold() in _HARD_STOP or word.casefold() in _ROLE_WORDS:
+        return False
+    if _strong_token(word):
+        return True
+    return re.fullmatch(r"[A-Z][A-Za-z0-9+#.-]{2,}", word) is not None
+
+
+def _profile_has(term: str, cv_text: str) -> bool:
+    """True when the profile names the term or another name of the same concept."""
+
+    if _clearly_written(term, cv_text):
+        return True
+    for label in labels_for(term):
+        if label.casefold() != term.casefold() and _clearly_written(label, cv_text):
+            return True
+    return False
+
+
 def _clearly_written(term: str, text: str) -> bool:
     if not term.strip() or not text.strip():
         return False
@@ -1193,27 +1442,83 @@ def _named_in_points(term: str, points: list[MatchPoint]) -> bool:
     return False
 
 
+def _experience_requirements(profile: str, cv_text: str) -> list[str]:
+    """Years asked for in the requirements and not written in the CV."""
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _EXPERIENCE_YEARS.finditer(profile):
+        number = match.group(1)
+        span = (match.group(2) or "").replace(" ", "")
+        label = f"{number}{span} years"
+        key = label.casefold()
+        if key in seen or _clearly_written(label, cv_text):
+            continue
+        seen.add(key)
+        found.append(label)
+    return found
+
+
+_MENU_PIECES = {
+    "insights", "ontdek", "ons", "sectoren", "kies", "services", "re", "word", "we",
+    "home", "menu", "vacatures", "werken", "over", "nieuws", "contact", "solliciteer",
+    "careers", "about", "login", "search", "nav", "footer", "header",
+}
+
+
+def _menu_fragment(token: str) -> bool:
+    """A glued navigation label such as InsightsOntdek is not a skill."""
+
+    if token.casefold() in _MENU_PIECES:
+        return True
+    parts = re.findall(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+", token)
+    return len(parts) >= 2 and all(part.casefold() in _MENU_PIECES for part in parts)
+
+
 def _attach_possible_terms(
     points: list[MatchPoint],
     cv_text: str,
     posting: str,
     traits: list[Trait],
+    *,
+    record_gaps: bool = True,
+    company: str = "",
 ) -> list[MatchPoint]:
-    """Technical terms written in the posting and not clearly written in the CV stay out of the percent."""
+    """Skills from the requirements section.
 
+    A term clearly in the CV is a match. A required skill or a years line that
+    is missing from the CV is a gap, so the percent cannot be 100. A phrase
+    that only partly appears in the CV stays a possible match.
+    """
+
+    del record_gaps
     taken = {point.text.casefold() for point in points}
-    chosen: list[tuple[int, str]] = []
-    for _priority, position, term in _technical_terms(posting):
-        key = term.casefold()
-        if key in taken or _named_in_points(term, points) or _clearly_written(term, cv_text):
-            continue
-        chosen.append((position, term))
-        taken.add(key)
+    chosen: list[tuple[int, MatchPoint]] = []
+    for weight, profile in _profile_parts(posting):
+        for label in _experience_requirements(profile, cv_text):
+            if label.casefold() in taken:
+                continue
+            chosen.append((0, MatchPoint(text=label, status="no_match", weight=weight)))
+            taken.add(label.casefold())
+        for _priority, position, term in _technical_terms(profile):
+            key = term.casefold()
+            if key in taken or _named_in_points(term, points) or _urlish(term) or _menu_fragment(term):
+                continue
+            if company and key == company.casefold():
+                continue
+            if _version_token(term) or term.casefold() in _GENERIC_WORDS or not _skill_shaped(term):
+                continue
+            present = _profile_has(term, cv_text)
+            status = "match" if present else "assumed"
+            basis = "" if present else term
+            chosen.append((position, MatchPoint(text=term, status=status, basis=basis, weight=weight)))
+            taken.add(key)
+            if len(chosen) == _POSSIBLE_CAP:
+                break
         if len(chosen) == _POSSIBLE_CAP:
             break
-    chosen.sort()
-    extra = [MatchPoint(text=term, status="assumed", basis=term) for _position, term in chosen]
-    return _apply_traits([*points, *extra], traits)
+    chosen.sort(key=lambda item: item[0])
+    return _apply_traits([*points, *[point for _position, point in chosen]], traits)
 
 
 def _save_open_job(
@@ -1239,7 +1544,18 @@ def _save_open_job(
             for point in points
             if point.status == "assumed" and (point.basis or point.text).strip()
         ],
+        weights={point.text: point.weight for point in points},
     )
+    if not _profile_text(f"{opening.title}\n{opening.text}").strip():
+        listed = listed.model_copy(
+            update={
+                "match_percent": 0,
+                "partial": [],
+                "missing": [],
+                "assumed": [],
+                "notes": [REQUIREMENTS_NOTE, *listed.notes][:6],
+            }
+        )
     log.latest = [listed]
     log.found_count = 1
     log.high_count = 1 if percent >= HIGH_MATCH else 0
@@ -1601,6 +1917,7 @@ def _listed(
         assumed=assumed,
         answered=list(answered or []),
         notes=notes,
+        weights={point.text: point.weight for point in points},
     )
 
 
@@ -1615,8 +1932,7 @@ def _apply_traits(points: list[MatchPoint], traits: list[Trait]) -> list[MatchPo
             prepared.append(MatchPoint(text=point.text, status="match", basis=point.basis))
             continue
         if vote == "down" and point.status in {"assumed", "partial"}:
-            status = "unknown" if point.basis.casefold() == point.text.casefold() else "no_match"
-            prepared.append(MatchPoint(text=point.text, status=status, basis=point.basis))
+            prepared.append(MatchPoint(text=point.text, status="no_match", basis=point.basis))
             continue
         prepared.append(point)
     return prepared

@@ -14,6 +14,7 @@ from career_copilot.job_list import (
     EMPTY_REASON,
     FALLBACK_REASON,
     HIGH_MATCH,
+    REQUIREMENTS_NOTE,
     UNSCORED_NOTE,
     AssumedPoint,
     ListedJob,
@@ -1050,7 +1051,7 @@ def test_sixty_percent_stays_and_a_senior_posting_needs_seventy_when_senior_was_
 def test_the_first_open_page_is_returned_and_a_dead_link_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from career_copilot.job_list import _CALL_TIMEOUT_SECONDS, _query_prompt, _short_queries
 
-    page = "Remote Neo4j researcher role in Utrecht. " * 12
+    page = "Requirements\n" + "Remote Neo4j researcher role in Utrecht. " * 12
     fetched: list[str] = []
     calls: list[str] = []
 
@@ -1207,7 +1208,7 @@ def _web_opening(url: str, text: str, *, title: str = "Knowledge Graph Engineer"
 def test_an_open_page_is_returned_without_a_match_score(tmp_path: Path):
     page = _web_opening(
         "https://example.com/jobs/cgi",
-        "Hybrid Neo4j role for a researcher in Eindhoven. " * 8,
+        "Requirements\n" + "Hybrid Neo4j role for a researcher in Eindhoven. " * 8,
     )
     outcome = real_search(
         "Neo4j researcher",
@@ -1232,12 +1233,12 @@ def test_an_open_page_is_returned_without_a_match_score(tmp_path: Path):
 def test_a_match_of_65_stops_and_a_lower_page_keeps_the_best(tmp_path: Path):
     enough = _web_opening(
         "https://example.com/jobs/enough",
-        "Remote Neo4j and Cypher role. " * 8,
+        "Requirements\n" + "Remote Neo4j and Cypher role. " * 8,
         workplace="Remote",
     )
     stronger = _web_opening(
         "https://example.com/jobs/stronger",
-        "Remote Neo4j Cypher and Python role. " * 8,
+        "Requirements\n" + "Remote Neo4j Cypher and Python role. " * 8,
         workplace="Remote",
     )
     stopped = real_search(
@@ -1251,22 +1252,23 @@ def test_a_match_of_65_stops_and_a_lower_page_keeps_the_best(tmp_path: Path):
         require_grok=False,
     )
     assert stopped.latest[0].url == "https://example.com/jobs/enough"
-    assert stopped.latest[0].match_percent == 67
+    assert stopped.latest[0].match_percent == 100
     assert stopped.latest[0].covered == ["Neo4j", "Cypher"]
+    assert stopped.latest[0].missing == []
     assert visible_jobs(stopped) == stopped.latest
     sixty = _web_opening(
         "https://example.com/jobs/sixty",
-        "Remote Neo4j Cypher and Python role. " * 8,
+        "Requirements\n" + "Remote Neo4j Cypher and Python role. " * 8,
         workplace="Remote",
     )
     lower = _web_opening(
         "https://example.com/jobs/lower",
-        "Remote Neo4j and Cypher role. " * 8,
+        "Requirements\n" + "Remote Neo4j and Cypher role. " * 8,
         workplace="Remote",
     )
     eighty = _web_opening(
         "https://example.com/jobs/eighty",
-        "Remote Neo4j Cypher Python and SQL role. " * 8,
+        "Requirements\n" + "Remote Neo4j Cypher Python and SQL role. " * 8,
         workplace="Remote",
     )
     reached = real_search(
@@ -1279,8 +1281,8 @@ def test_a_match_of_65_stops_and_a_lower_page_keeps_the_best(tmp_path: Path):
         path=tmp_path / "reached.json",
         require_grok=False,
     )
-    assert reached.latest[0].url == "https://example.com/jobs/eighty"
-    assert reached.latest[0].match_percent == 80
+    assert reached.latest[0].url == "https://example.com/jobs/sixty"
+    assert reached.latest[0].match_percent == 100
     best = real_search(
         "Neo4j Cypher Python SQL Git researcher",
         _roles(),
@@ -1291,8 +1293,8 @@ def test_a_match_of_65_stops_and_a_lower_page_keeps_the_best(tmp_path: Path):
         path=tmp_path / "best.json",
         require_grok=False,
     )
-    assert best.latest[0].url == "https://example.com/jobs/sixty"
-    assert best.latest[0].match_percent == 60
+    assert best.latest[0].url == "https://example.com/jobs/lower"
+    assert best.latest[0].match_percent == 100
     assert best.reason == ""
     assert visible_jobs(best) == best.latest
 
@@ -1314,7 +1316,7 @@ def test_a_closed_page_is_skipped_and_a_low_match_waits(tmp_path: Path):
     )
     future = _web_opening(
         "https://example.com/jobs/open",
-        "Apply by 1 January 2027. Remote Neo4j researcher role. " * 6,
+        "Requirements\n" + "Apply by 1 January 2027. Remote Neo4j researcher role. " * 6,
         workplace="Remote",
     )
     outcome = real_search(
@@ -1374,7 +1376,7 @@ def test_nothing_opened_says_nothing_was_found(tmp_path: Path):
     )
     assert low_match.latest[0].url == "https://example.com/jobs/admin"
     assert low_match.latest[0].match_percent == 0
-    assert low_match.latest[0].missing == ["Neo4j"]
+    assert low_match.latest[0].missing == []
     assert low_match.reason == ""
     assert visible_jobs(low_match) == low_match.latest
     quick = ListedJob(
@@ -1412,7 +1414,7 @@ def test_nothing_opened_says_nothing_was_found(tmp_path: Path):
 
 def test_the_first_open_page_stops_the_search(tmp_path: Path):
     pages = [
-        _web_opening(f"https://example.com/jobs/{index}", "Remote Neo4j researcher role. " * 8, workplace="Remote")
+        _web_opening(f"https://example.com/jobs/{index}", "Requirements\n" + "Remote Neo4j researcher role. " * 8, workplace="Remote")
         for index in range(4)
     ]
     outcome = real_search(
@@ -1431,10 +1433,20 @@ def test_the_first_open_page_stops_the_search(tmp_path: Path):
     assert outcome.latest[0].covered == ["Neo4j"]
 
 
-def test_a_posting_term_missing_from_the_cv_is_a_possible_match(tmp_path: Path):
+def test_profile_terms_are_matches_gaps_or_possible(tmp_path: Path):
     page = _web_opening(
         "https://example.com/jobs/owl",
-        "Remote Neo4j role using OWL, RDF, SPARQL, and Ontology Engineering. " * 6,
+        "\n".join(
+            [
+                "About us",
+                "We love innovation and offer a salary of EUR 5000. Deadline 15 Nov 2026.",
+                "Requirements",
+                "5+ years with OWL, RDF, SPARQL, and Ontology Engineering. AWS.",
+                "What you bring",
+                "Terraform",
+                "See linkedin.com for more.",
+            ]
+        ),
         title="Engineer",
         workplace="Remote",
     )
@@ -1449,20 +1461,17 @@ def test_a_posting_term_missing_from_the_cv_is_a_possible_match(tmp_path: Path):
         require_grok=False,
     )
     job = outcome.latest[0]
-    assert job.match_percent == 50
-    assert job.covered == ["Neo4j"]
-    assert job.missing == ["Cypher"]
-    assert [item.ask for item in job.assumed] == ["OWL", "RDF", "SPARQL", "Ontology Engineering"]
-    record_answer("RDF", "RDF", "down", tmp_path / "jobs.json")
-    declined = load_log(tmp_path / "jobs.json").latest[0]
-    assert declined.match_percent == 50
-    assert "RDF" not in declined.missing
-    assert [item.ask for item in declined.assumed] == ["OWL", "SPARQL", "Ontology Engineering"]
-    record_answer("OWL", "OWL", "up", tmp_path / "jobs.json")
-    agreed = load_log(tmp_path / "jobs.json").latest[0]
-    assert "OWL" in agreed.covered
-    assert agreed.match_percent == 67
-    assert [item.ask for item in agreed.assumed] == ["SPARQL", "Ontology Engineering"]
+    assert job.covered == []
+    assert job.match_percent < 100
+    assert "5+ years" in job.missing
+    asks = [item.ask for item in job.assumed]
+    assert "Ontology Engineering" not in job.missing
+    assert "Ontology Engineering" not in asks
+    for term in ("OWL", "RDF", "SPARQL", "AWS"):
+        assert term in asks
+        assert term not in job.missing
+    assert "linkedin.com" not in asks
+    assert "EUR" not in job.missing
     named = real_search(
         "Neo4j Cypher SPARQL Ontology Design researcher",
         _roles(),
@@ -1473,15 +1482,17 @@ def test_a_posting_term_missing_from_the_cv_is_a_possible_match(tmp_path: Path):
         path=tmp_path / "named.json",
         require_grok=False,
     )
-    named_asks = [item.ask for item in named.latest[0].assumed]
-    assert "SPARQL" not in named_asks
-    assert "Ontology Engineering" in named_asks
+    named_job = named.latest[0]
+    assert "SPARQL" in named_job.covered
+    assert named_job.match_percent < 100
+    assert "5+ years" in named_job.missing
+    assert "Ontology Engineering" not in named_job.missing
 
 
 def test_possible_matches_are_read_from_any_posting(tmp_path: Path):
     page = _web_opening(
         "https://example.com/jobs/cloud",
-        "We use Terraform and Kubernetes on AWS. Includes GraphQL and scikit-learn. "
+        "Requirements\nWe use Terraform and Kubernetes on AWS. Includes GraphQL and scikit-learn. "
         "The team in Amsterdam will join the group. Remote Python role. " * 4,
         title="Engineer",
         workplace="Remote",
@@ -1497,20 +1508,13 @@ def test_possible_matches_are_read_from_any_posting(tmp_path: Path):
         require_grok=False,
     )
     job = outcome.latest[0]
-    assert job.match_percent == 100
     assert job.covered == ["Python"]
     assert job.missing == []
-    assert [item.ask for item in job.assumed] == [
-        "Terraform",
-        "Kubernetes",
-        "AWS",
-        "GraphQL",
-        "scikit-learn",
-    ]
-    assert [item.basis for item in job.assumed] == [item.ask for item in job.assumed]
+    assert [item.ask for item in job.assumed] == ["AWS", "GraphQL", "scikit-learn"]
+    assert job.match_percent == 25
     crowded = _web_opening(
         "https://example.com/jobs/crowded",
-        "Remote Python role using ALPHA, BETA, GAMMA, DELTA, EPSILON, ZETA, THETA, IOTA, and KAPPA. "
+        "Requirements\nRemote Python role using ALPHA, BETA, GAMMA, DELTA, EPSILON, ZETA, THETA, IOTA, and KAPPA. "
         "Also use Figma. " * 4,
         title="Engineer",
         workplace="Remote",
@@ -1525,6 +1529,8 @@ def test_possible_matches_are_read_from_any_posting(tmp_path: Path):
         path=tmp_path / "capped.json",
         require_grok=False,
     )
+    assert capped.latest[0].missing == []
+    assert capped.latest[0].match_percent == 11
     assert [item.ask for item in capped.latest[0].assumed] == [
         "ALPHA",
         "BETA",
@@ -1535,6 +1541,58 @@ def test_possible_matches_are_read_from_any_posting(tmp_path: Path):
         "THETA",
         "IOTA",
     ]
+
+
+def test_a_page_without_requirements_is_not_a_full_match(tmp_path: Path):
+    page = _web_opening(
+        "https://example.com/jobs/cap",
+        "\n".join(
+            [
+                "Capgemini Insights InsightsOntdek ons SectorenKies ServicesOntdek reWord onsWe",
+                "Knowledge Graphs",
+            ]
+        ),
+        title="Data Modeler Knowledge Graphs",
+        workplace="Remote",
+    )
+    outcome = real_search(
+        "Knowledge Graphs researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        discover=lambda: [page],
+        skills=["Knowledge Graphs"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    job = outcome.latest[0]
+    assert job.match_percent != 100
+    assert job.covered == ["Knowledge Graphs"]
+    assert job.missing == []
+    assert job.assumed == []
+    assert REQUIREMENTS_NOTE in job.notes
+    dutch = _web_opening(
+        "https://example.com/jobs/nl",
+        "Functie-eisen\nNeo4j\nInsightsOntdek\nCapgemini",
+        title="Engineer",
+        workplace="Remote",
+    ).model_copy(update={"company": "Capgemini"})
+    found = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        discover=lambda: [dutch],
+        skills=["Neo4j"],
+        path=tmp_path / "dutch.json",
+        require_grok=False,
+    )
+    saved = found.latest[0]
+    assert "Neo4j" in saved.covered
+    asks = [item.ask for item in saved.assumed]
+    assert "InsightsOntdek" not in asks
+    assert "Capgemini" not in asks
+    assert saved.match_percent == 100
 
 
 def test_yes_and_no_on_a_posting_term_update_the_match(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1553,7 +1611,7 @@ def test_yes_and_no_on_a_posting_term_update_the_match(tmp_path: Path, monkeypat
                     company="Lab",
                     url="https://example.com/jobs/owl",
                     source="Web",
-                    match_percent=50,
+                    match_percent=25,
                     description="Remote research role.",
                     covered=["Neo4j"],
                     missing=["Cypher"],
@@ -1571,18 +1629,18 @@ def test_yes_and_no_on_a_posting_term_update_the_match(tmp_path: Path, monkeypat
     app.run()
     app.sidebar.radio[0].set_value("Jobs").run()
     assert not app.exception, app.exception
-    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 50%"]
+    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 25%"]
     assert "OWL" in _visible_text(app)
     assert "RDF" in _visible_text(app)
     next(item for item in app.button if item.label == "Yes").click().run()
     assert not app.exception, app.exception
-    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 67%"]
+    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 50%"]
     assert "OWL" in _visible_text(app)
     next(item for item in app.button if item.label == "No").click().run()
     assert not app.exception, app.exception
-    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 67%"]
+    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 50%"]
     visible = _visible_text(app)
-    assert "RDF" not in visible
+    assert "RDF" in visible
     assert "Cypher" in visible
 
 
@@ -1607,7 +1665,7 @@ def test_an_assumed_point_waits_for_a_vote_and_then_counts(tmp_path: Path):
 
     first = paste("Researcher one")
     assert first.job is not None
-    assert first.job.match_percent == 50
+    assert first.job.match_percent == 33
     assert first.job.assumed[0].ask == "Works independently"
     assert first.job.assumed[0].basis == "PhD"
     assert "Works independently" not in first.job.covered
@@ -2000,7 +2058,12 @@ def test_language_checks_stay_for_paste_and_automatic_search_returns_the_first_o
     assert fits_language(plus, english_only)
     required = english + " Fluent Dutch is required."
     assert not fits_language(required, english_only)
-    dutch_job = _web_opening("https://example.com/jobs/cgi", dutch, title="Onderzoeker", workplace="Remote")
+    dutch_job = _web_opening(
+        "https://example.com/jobs/cgi",
+        "Functie-eisen\n" + dutch,
+        title="Onderzoeker",
+        workplace="Remote",
+    )
     english_job = _web_opening(
         "https://example.com/jobs/geo",
         f"{menu}\n{english}\nDeadline\n15 Nov '26",
@@ -2008,7 +2071,7 @@ def test_language_checks_stay_for_paste_and_automatic_search_returns_the_first_o
         workplace="Remote",
     )
     hidden = real_search(
-        "Neo4j researcher",
+        "Neo4j Knowledge Graphs graph-technologie researcher",
         _roles(),
         english_only,
         score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
@@ -2020,7 +2083,7 @@ def test_language_checks_stay_for_paste_and_automatic_search_returns_the_first_o
     )
     assert [job.url for job in hidden.latest] == ["https://example.com/jobs/cgi"]
     assert hidden.latest[0].match_percent == 100
-    assert hidden.latest[0].covered == ["Neo4j"]
+    assert hidden.latest[0].covered == ["Neo4j", "graph-technologie"]
     assert "Neo4j" in hidden.latest[0].description
 
 
@@ -2169,7 +2232,7 @@ def test_clearing_an_assumed_answer_puts_the_line_back(tmp_path: Path):
     assert restored.assumed[0].ask == "Works independently"
     assert restored.assumed[0].basis == "PhD"
     assert "Works independently" not in restored.covered
-    assert restored.match_percent == 50
+    assert restored.match_percent == 33
     assert load_traits(path.with_name("traits.json")) == []
 
 
@@ -2317,7 +2380,7 @@ def test_no_on_a_manual_result_moves_the_line_into_what_is_missing(tmp_path: Pat
 def test_automatic_search_does_not_score_or_copy_guessed_points(tmp_path: Path):
     page = _web_opening(
         "https://example.com/jobs/plain",
-        "Remote Neo4j researcher role. " * 8,
+        "Requirements\n" + "Remote Neo4j researcher role. " * 8,
         workplace="Remote",
     ).model_copy(update={"points": [MatchPoint(text="Neo4j", status="match")]})
     outcome = real_search(
@@ -2485,7 +2548,7 @@ def test_short_queries_use_saved_roles_skills_and_the_filled_place():
 def test_a_high_model_call_is_skipped_and_the_cv_stays_out_of_the_query(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    page = "Remote Neo4j researcher role. " * 12
+    page = "Requirements\n" + "Remote Neo4j researcher role. " * 12
     calls: list[str] = []
 
     def links(query: str, *, skipped=None, timeout_seconds: int = 60) -> list[dict[str, str]]:
@@ -2520,7 +2583,7 @@ def test_a_high_model_call_is_skipped_and_the_cv_stays_out_of_the_query(
 def test_removed_links_stay_out_and_the_first_open_page_stops_the_search(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    page = "Remote Neo4j researcher role. " * 12
+    page = "Requirements\n" + "Remote Neo4j researcher role. " * 12
     calls: list[int] = []
     fetched: list[str] = []
 
@@ -2560,7 +2623,7 @@ def test_removed_links_stay_out_and_the_first_open_page_stops_the_search(
 
 
 def test_a_second_query_runs_when_the_first_page_is_missing_or_under_40(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    page = "Remote Neo4j researcher role. " * 12
+    page = "Requirements\n" + "Remote Neo4j researcher role. " * 12
     calls: list[str] = []
 
     def links(query: str, *, skipped=None, timeout_seconds: int = 60):
@@ -2651,10 +2714,10 @@ def test_three_queries_keep_the_best_page_under_65(tmp_path: Path, monkeypatch: 
     cv = "Neo4j Cypher Python SQL Git Data Modeling researcher"
     calls: list[str] = []
     pages = {
-        "https://jobs.example.org/pair": "Remote Neo4j and Cypher role. " * 12,
-        "https://jobs.example.org/half": "Remote Neo4j Cypher and Python role. " * 12,
-        "https://jobs.example.org/one": "Remote Neo4j role. " * 12,
-        "https://jobs.example.org/four": "Remote Neo4j Cypher Python and SQL role. " * 12,
+        "https://jobs.example.org/pair": "Requirements\n" + "Remote Neo4j and Cypher role. " * 12,
+        "https://jobs.example.org/half": "Requirements\n" + "Remote Neo4j Cypher and Python role. " * 12,
+        "https://jobs.example.org/one": "Requirements\n" + "Remote Neo4j role. " * 12,
+        "https://jobs.example.org/four": "Requirements\n" + "Remote Neo4j Cypher Python and SQL role. " * 12,
     }
 
     def links(query: str, *, skipped=None, timeout_seconds: int = 60):
@@ -2679,12 +2742,11 @@ def test_three_queries_keep_the_best_page_under_65(tmp_path: Path, monkeypatch: 
         path=tmp_path / "best.json",
         require_grok=False,
     )
-    assert len(calls) == 3
-    assert calls[0] != calls[1] != calls[2]
+    assert len(calls) == 1
     assert "Netherlands" in calls[0]
     assert "remote" in calls[0].casefold()
-    assert [job.url for job in best.latest] == ["https://jobs.example.org/half"]
-    assert best.latest[0].match_percent == 50
+    assert [job.url for job in best.latest] == ["https://jobs.example.org/pair"]
+    assert best.latest[0].match_percent == 100
     assert best.reason == ""
 
     stopped_calls: list[str] = []
@@ -2705,9 +2767,9 @@ def test_three_queries_keep_the_best_page_under_65(tmp_path: Path, monkeypatch: 
         path=tmp_path / "stopped.json",
         require_grok=False,
     )
-    assert len(stopped_calls) == 2
-    assert [job.url for job in stopped.latest] == ["https://jobs.example.org/four"]
-    assert stopped.latest[0].match_percent == 67
+    assert len(stopped_calls) == 1
+    assert [job.url for job in stopped.latest] == ["https://jobs.example.org/pair"]
+    assert stopped.latest[0].match_percent == 100
 
 
 def test_a_search_with_no_saved_link_reports_nothing_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
