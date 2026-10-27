@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from career_copilot.errors import CareerCopilotError
 from career_copilot.roles import FAST_MODEL, WorkRole, child_env, grok_score_argv, grok_search_argv
 from career_copilot.search_intent import SearchConditions
+from career_copilot.vocab import skill_named_in
 
 HIGH_MATCH = 70
 MIN_MATCH = 50
@@ -37,6 +38,21 @@ WEB_SHOWN = 3
 _CALL_TIMEOUT_SECONDS = 60
 TARGET_MATCH = 65
 _LINKS_PER_QUERY = 3
+_POSTING_TERMS = (
+    "OWL",
+    "RDF",
+    "RDFS",
+    "SPARQL",
+    "SHACL",
+    "SKOS",
+    "JSON-LD",
+    "Ontology Engineering",
+    "GraphRAG",
+    "Graphwise",
+    "Linked Data",
+    "CIDOC-CRM",
+)
+_POSTING_TERM_KEYS = {term.casefold() for term in _POSTING_TERMS}
 FALLBACK_REASON = "Nada foi encontrado, então retornamos a vaga com o maior match com o seu CV."
 EMPTY_REASON = "Nada foi encontrado."
 UNSCORED_NOTE = "The match was not scored."
@@ -288,9 +304,25 @@ def revise_job(job: ListedJob, ask: str, basis: str, vote: str | None) -> Listed
     elif vote == "down":
         if in_missing and in_answered:
             return job
-        if not (in_partial or in_assumed or in_answered):
+        posting_term = any(
+            _same_line(item.ask, cleaned_ask) and _same_line(item.basis, item.ask)
+            for item in job.assumed
+        )
+        if posting_term:
+            destination = "out"
+        elif (
+            cleaned_basis.casefold() == cleaned_ask.casefold()
+            and in_answered
+            and not in_partial
+            and not in_assumed
+            and not in_missing
+            and not in_covered
+        ):
             return job
-        destination = "missing"
+        elif not (in_partial or in_assumed or in_answered):
+            return job
+        else:
+            destination = "missing"
     elif not in_answered:
         return job
     else:
@@ -306,9 +338,11 @@ def revise_job(job: ListedJob, ask: str, basis: str, vote: str | None) -> Listed
     elif destination == "missing":
         missing.append(cleaned_ask)
         answered.append(cleaned_ask)
-    elif cleaned_basis.casefold() != cleaned_ask.casefold():
+    elif destination == "out":
+        answered.append(cleaned_ask)
+    elif destination == "possible" and cleaned_basis.casefold() != cleaned_ask.casefold():
         assumed.append(AssumedPoint(ask=cleaned_ask, basis=cleaned_basis))
-    else:
+    elif destination == "possible":
         partial.append(cleaned_ask)
     updated = job.model_copy(
         update={
@@ -646,10 +680,17 @@ def _search_web(
 ) -> SearchLog:
     del score
     best: tuple[int, _Opening, list[MatchPoint]] | None = None
+    traits = load_traits(traits_for_jobs(path))
 
     def consider(opening: _Opening) -> SearchLog | None:
         nonlocal best
-        percent, points = _quick_match(cv_text, f"{opening.title}\n{opening.text}", roles, skills)
+        percent, points = _quick_match(
+            cv_text,
+            f"{opening.title}\n{opening.text}",
+            roles,
+            skills,
+            traits,
+        )
         if best is None or percent > best[0]:
             best = (percent, opening, points)
         if percent >= TARGET_MATCH:
@@ -810,13 +851,46 @@ def _quick_match(
     posting: str,
     roles: list[WorkRole],
     skills: list[str],
+    traits: list[Trait] | None = None,
 ) -> tuple[int, list[MatchPoint]]:
     terms = _quick_terms(cv_text, roles, skills)
     points = [
         MatchPoint(text=term, status="match" if _term_in_text(posting, term) else "no_match")
         for term in terms
     ]
+    points = _attach_possible_terms(points, cv_text, posting, traits or [])
     return match_percent(points) or 0, points
+
+
+def _attach_possible_terms(
+    points: list[MatchPoint],
+    cv_text: str,
+    posting: str,
+    traits: list[Trait],
+) -> list[MatchPoint]:
+    """Terms written in the posting and not written in the CV stay out of the percent."""
+
+    taken = {point.text.casefold() for point in points}
+    extra: list[MatchPoint] = []
+    for term in _POSTING_TERMS:
+        if len(extra) == 8:
+            break
+        if term.casefold() in taken or not skill_named_in(term, posting) or skill_named_in(term, cv_text):
+            continue
+        extra.append(MatchPoint(text=term, status="assumed", basis=term))
+        taken.add(term.casefold())
+    converted: list[MatchPoint] = []
+    for point in points:
+        if (
+            point.status == "no_match"
+            and point.text.casefold() in _POSTING_TERM_KEYS
+            and skill_named_in(point.text, posting)
+            and not skill_named_in(point.text, cv_text)
+        ):
+            converted.append(MatchPoint(text=point.text, status="assumed", basis=point.text))
+        else:
+            converted.append(point)
+    return _apply_traits([*converted, *extra], traits)
 
 
 def _save_open_job(
@@ -835,7 +909,13 @@ def _save_open_job(
         match_percent=percent,
         description=text,
         covered=[point.text for point in points if point.status == "match"],
+        partial=[point.text for point in points if point.status == "partial"],
         missing=[point.text for point in points if point.status == "no_match"],
+        assumed=[
+            AssumedPoint(ask=point.text, basis=point.basis or point.text)
+            for point in points
+            if point.status == "assumed" and (point.basis or point.text).strip()
+        ],
     )
     log.latest = [listed]
     log.found_count = 1
@@ -929,12 +1009,18 @@ def consider_posting(
     existing = next((job for job in log.kept + log.latest if job_key(job) == key), None)
     if existing is not None:
         return PasteOutcome(note="This posting is already on the list.", job=existing)
+    traits = load_traits(traits_for_jobs(path))
     judged, answered = _judge(
         list(score(cleaned, _scoring_text(opening.text, roles, conditions))),
-        load_traits(traits_for_jobs(path)),
+        traits,
     )
     judged.extend(_condition_gaps(opening, conditions))
     judged.extend(_language_gap(opening, conditions))
+    before_terms = list(judged)
+    judged = _attach_possible_terms(judged, cleaned, f"{opening.title}\n{opening.text}", traits)
+    for name in _trait_answers(before_terms, judged):
+        if name not in answered:
+            answered.append(name)
     percent = match_percent(judged)
     if percent is None:
         listed = _listed(opening, 0, [], conditions)
@@ -1206,7 +1292,8 @@ def _apply_traits(points: list[MatchPoint], traits: list[Trait]) -> list[MatchPo
             prepared.append(MatchPoint(text=point.text, status="match", basis=point.basis))
             continue
         if vote == "down" and point.status in {"assumed", "partial"}:
-            prepared.append(MatchPoint(text=point.text, status="no_match", basis=point.basis))
+            status = "unknown" if point.basis.casefold() == point.text.casefold() else "no_match"
+            prepared.append(MatchPoint(text=point.text, status=status, basis=point.basis))
             continue
         prepared.append(point)
     return prepared
@@ -1222,7 +1309,11 @@ def _trait_answers(before: list[MatchPoint], after: list[MatchPoint]) -> list[st
     prior = {point.text.casefold(): point.status for point in before}
     names: list[str] = []
     for point in after:
-        if prior.get(point.text.casefold()) in {"partial", "assumed"} and point.status in {"match", "no_match"}:
+        if prior.get(point.text.casefold()) in {"partial", "assumed"} and point.status in {
+            "match",
+            "no_match",
+            "unknown",
+        }:
             names.append(point.text)
     return names
 

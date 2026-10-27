@@ -1431,6 +1431,100 @@ def test_the_first_open_page_stops_the_search(tmp_path: Path):
     assert outcome.latest[0].covered == ["Neo4j"]
 
 
+def test_a_posting_term_missing_from_the_cv_is_a_possible_match(tmp_path: Path):
+    page = _web_opening(
+        "https://example.com/jobs/owl",
+        "Remote Neo4j role using OWL, RDF, SPARQL, and Ontology Engineering. " * 6,
+        title="Engineer",
+        workplace="Remote",
+    )
+    outcome = real_search(
+        "Neo4j Cypher researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        discover=lambda: [page],
+        skills=["Neo4j", "Cypher"],
+        path=tmp_path / "jobs.json",
+        require_grok=False,
+    )
+    job = outcome.latest[0]
+    assert job.match_percent == 50
+    assert job.covered == ["Neo4j"]
+    assert job.missing == ["Cypher"]
+    assert [item.ask for item in job.assumed] == ["OWL", "RDF", "SPARQL", "Ontology Engineering"]
+    record_answer("RDF", "RDF", "down", tmp_path / "jobs.json")
+    declined = load_log(tmp_path / "jobs.json").latest[0]
+    assert declined.match_percent == 50
+    assert "RDF" not in declined.missing
+    assert [item.ask for item in declined.assumed] == ["OWL", "SPARQL", "Ontology Engineering"]
+    record_answer("OWL", "OWL", "up", tmp_path / "jobs.json")
+    agreed = load_log(tmp_path / "jobs.json").latest[0]
+    assert "OWL" in agreed.covered
+    assert agreed.match_percent == 67
+    assert [item.ask for item in agreed.assumed] == ["SPARQL", "Ontology Engineering"]
+    named = real_search(
+        "Neo4j Cypher SPARQL researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        discover=lambda: [page],
+        skills=["Neo4j", "Cypher"],
+        path=tmp_path / "named.json",
+        require_grok=False,
+    )
+    assert "SPARQL" not in [item.ask for item in named.latest[0].assumed]
+
+
+def test_yes_and_no_on_a_posting_term_update_the_match(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("streamlit")
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    monkeypatch.chdir(tmp_path)
+    save_roles(tmp_path / ".career-copilot" / "roles.json", _roles())
+    save_search(_remote(), tmp_path / ".career-copilot" / "search.json")
+    save_log(
+        SearchLog(
+            latest=[
+                ListedJob(
+                    title="Engineer",
+                    company="Lab",
+                    url="https://example.com/jobs/owl",
+                    source="Web",
+                    match_percent=50,
+                    description="Remote research role.",
+                    covered=["Neo4j"],
+                    missing=["Cypher"],
+                    assumed=[
+                        AssumedPoint(ask="OWL", basis="OWL"),
+                        AssumedPoint(ask="RDF", basis="RDF"),
+                    ],
+                )
+            ]
+        ),
+        tmp_path / ".career-copilot" / "jobs.json",
+    )
+    script = Path(__file__).parents[1] / "src" / "career_copilot" / "ui_app.py"
+    app = AppTest.from_file(str(script), default_timeout=60)
+    app.run()
+    app.sidebar.radio[0].set_value("Jobs").run()
+    assert not app.exception, app.exception
+    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 50%"]
+    assert "OWL" in _visible_text(app)
+    assert "RDF" in _visible_text(app)
+    next(item for item in app.button if item.label == "Yes").click().run()
+    assert not app.exception, app.exception
+    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 67%"]
+    assert "OWL" in _visible_text(app)
+    next(item for item in app.button if item.label == "No").click().run()
+    assert not app.exception, app.exception
+    assert [item.value for item in app.subheader if str(item.value).startswith("Match:")] == ["Match: 67%"]
+    visible = _visible_text(app)
+    assert "RDF" not in visible
+    assert "Cypher" in visible
+
+
 def test_an_assumed_point_waits_for_a_vote_and_then_counts(tmp_path: Path):
     def score(_cv: str, _posting: str) -> list[MatchPoint]:
         return [
