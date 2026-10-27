@@ -1,8 +1,9 @@
 """Job list for phase 3.
 
-Automatic search builds one short query, asks the fast model for https
-links, opens pages until one is still open, and returns that job.
-A second query runs only when the first call returns no link.
+Automatic search builds one short query, asks the fast model for the
+first https link, opens that page, and keeps it when a quick CV match
+is at least 40 percent. A second query runs when that page is missing
+or the match is lower.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ MIN_MATCH = 50
 MAX_SCORED = 5
 WEB_SHOWN = 3
 _CALL_TIMEOUT_SECONDS = 60
+QUICK_MATCH = 40
 FALLBACK_REASON = "Nada foi encontrado, então retornamos a vaga com o maior match com o seu CV."
 EMPTY_REASON = "Nada foi encontrado."
 UNSCORED_NOTE = "The match was not scored."
@@ -432,7 +434,11 @@ def visible_jobs(log: SearchLog) -> list[ListedJob]:
     unscored = [job for job in latest if _unscored(job)]
     if unscored:
         add(unscored[0])
-    qualified = [job for job in latest if job.match_percent >= MIN_MATCH and not _unscored(job)]
+    qualified = [
+        job
+        for job in latest
+        if not _unscored(job) and (job.match_percent >= MIN_MATCH or _web_quick_match(job))
+    ]
     if qualified:
         ranked = sorted(qualified, key=lambda job: job.match_percent, reverse=True)
         for job in ranked[:WEB_SHOWN]:
@@ -608,6 +614,11 @@ def real_search(
     return log
 
 
+def _web_quick_match(job: ListedJob) -> bool:
+    judged = bool(job.covered or job.partial or job.missing or job.assumed)
+    return job.source == "Web" and judged and job.match_percent >= QUICK_MATCH
+
+
 def _unscored(job: ListedJob) -> bool:
     return (
         not job.covered
@@ -632,13 +643,16 @@ def _search_web(
     log: SearchLog,
     blocked: set[str],
 ) -> SearchLog:
-    del cv_text, score
+    del score
     if discover is not None:
         progress("Opening the page.")
         for opening in discover():
             if opening.url in blocked or not _opening_is_open(opening, today):
                 continue
-            return _save_open_job(log, opening, path)
+            percent, points = _quick_match(cv_text, f"{opening.title}\n{opening.text}", roles, skills)
+            if percent < QUICK_MATCH:
+                continue
+            return _save_open_job(log, opening, path, percent, points)
         return _save_nothing(log, path)
 
     removed = sorted(url for url in blocked if url.startswith("https://"))
@@ -652,28 +666,27 @@ def _search_web(
                 if "did not return a search" not in str(exc).casefold():
                     raise
             links = []
-        if not links:
+        item = _first_valid_link(links, blocked)
+        if item is None:
             continue
+        url = str(item.get("url", "")).strip()
         progress("Opening the page.")
-        for item in links:
-            url = str(item.get("url", "")).strip()
-            if not url.startswith("https://") or url in blocked:
-                continue
-            try:
-                page = fetch_posting(url)
-            except CareerCopilotError:
-                continue
-            opening = _opening_from_page(item, url, page)
-            if not _opening_is_open(opening, today):
-                continue
-            return _save_open_job(log, opening, path)
-        # The first call returned links. A second query runs only when there are none.
-        break
+        try:
+            page = fetch_posting(url)
+        except CareerCopilotError:
+            continue
+        opening = _opening_from_page(item, url, page)
+        if not _opening_is_open(opening, today):
+            continue
+        percent, points = _quick_match(cv_text, f"{opening.title}\n{opening.text}", roles, skills)
+        if percent < QUICK_MATCH:
+            continue
+        return _save_open_job(log, opening, path, percent, points)
     return _save_nothing(log, path)
 
 
 def _short_queries(roles: list[WorkRole], skills: list[str], conditions: SearchConditions) -> list[str]:
-    """One short query, plus a second only for the caller to use when the first has no link."""
+    """One short query, plus a second when the first page is missing or under 40 percent."""
 
     role_names = _unique_terms([role.name for role in roles if role.kept])[:2]
     skill_names = _unique_terms(list(skills))[:3]
@@ -727,20 +740,80 @@ def _opening_from_page(item: dict[str, object], url: str, page: str) -> _Opening
     )
 
 
-def _save_open_job(log: SearchLog, opening: _Opening, path: Path | None) -> SearchLog:
+def _first_valid_link(links: list[dict[str, object]], blocked: set[str]) -> dict[str, object] | None:
+    for item in links:
+        url = str(item.get("url", "")).strip()
+        if not url.startswith("https://") or url in blocked:
+            continue
+        host = urllib.parse.urlparse(url).hostname or ""
+        if _blocked_job_host(host) or _private_host(host):
+            continue
+        return item
+    return None
+
+
+def _fold_phrase(text: str) -> list[str]:
+    words: list[str] = []
+    for word in re.findall(r"[a-z0-9+#]+", text.casefold()):
+        if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+            word = word[:-1]
+        words.append(word)
+    return words
+
+
+def _term_in_text(text: str, term: str) -> bool:
+    phrase = _fold_phrase(term)
+    words = _fold_phrase(text)
+    width = len(phrase)
+    if width == 0 or width > len(words):
+        return False
+    return any(words[index : index + width] == phrase for index in range(len(words) - width + 1))
+
+
+def _quick_terms(cv_text: str, roles: list[WorkRole], skills: list[str]) -> list[str]:
+    """Saved skills written in the CV. Role names are used only when no skill is in the CV."""
+
+    in_cv = [term for term in _unique_terms(list(skills)) if _term_in_text(cv_text, term)]
+    if in_cv:
+        return in_cv
+    return [role.name for role in roles if role.kept and role.name.strip() and _term_in_text(cv_text, role.name)]
+
+
+def _quick_match(
+    cv_text: str,
+    posting: str,
+    roles: list[WorkRole],
+    skills: list[str],
+) -> tuple[int, list[MatchPoint]]:
+    terms = _quick_terms(cv_text, roles, skills)
+    points = [
+        MatchPoint(text=term, status="match" if _term_in_text(posting, term) else "no_match")
+        for term in terms
+    ]
+    return match_percent(points) or 0, points
+
+
+def _save_open_job(
+    log: SearchLog,
+    opening: _Opening,
+    path: Path | None,
+    percent: int,
+    points: list[MatchPoint],
+) -> SearchLog:
     text = prepare_posting(opening.text, opening.title) or opening.text
     listed = ListedJob(
         title=opening.title[:120] or "Job",
         company=opening.company[:120] or "Unknown",
         url=opening.url,
         source=opening.source or "Web",
-        match_percent=0,
+        match_percent=percent,
         description=text,
-        notes=[UNSCORED_NOTE],
+        covered=[point.text for point in points if point.status == "match"],
+        missing=[point.text for point in points if point.status == "no_match"],
     )
     log.latest = [listed]
     log.found_count = 1
-    log.high_count = 0
+    log.high_count = 1 if percent >= HIGH_MATCH else 0
     log.below_count = 0
     log.reason = ""
     save_log(log, path)
@@ -1683,7 +1756,7 @@ def _query_prompt(query: str) -> str:
     return (
         "Use the fastest model available.\n"
         "Use one web search for the query below, then stop.\n"
-        "Return only https links of job postings that look open.\n"
+        "Return only the first valid https link. Stop immediately.\n"
         "Each item needs a title, a company, and one https url.\n"
         "Do not open the pages. Do not invent a job, a company, or a link. Do not use LinkedIn.\n"
         f"Query: {query}\n"
