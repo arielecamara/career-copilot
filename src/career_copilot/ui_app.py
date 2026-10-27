@@ -53,6 +53,7 @@ from career_copilot.job_list import (
     requested_documents,
     score_posting,
     short_line,
+    UNSCORED_NOTE,
     visible_jobs,
 )
 from career_copilot.llm import read_job
@@ -461,7 +462,7 @@ def _page_jobs(st) -> None:
                 "Title": [job.title for job in jobs],
                 "Company": [job.company for job in jobs],
                 "Found at": [job.source for job in jobs],
-                "Match": [f"{job.match_percent}%" for job in jobs],
+                "Match": [_match_label(job) for job in jobs],
             },
             alt="Job matches",
         )
@@ -557,6 +558,13 @@ def _possible_block(st, job: ListedJob, prefix: str) -> None:
             _store_answer(st, ask, basis, "down")
 
 
+def _match_label(job: ListedJob) -> str:
+    judged = job.covered or job.partial or job.missing or job.assumed
+    if UNSCORED_NOTE in job.notes and not judged:
+        return "Not scored"
+    return f"{job.match_percent}%"
+
+
 def _job_result(st, job: ListedJob, *, actions: bool = False, prefix: str = "open") -> None:
     st.subheader(job.title)
     if actions:
@@ -580,20 +588,22 @@ def _job_result(st, job: ListedJob, *, actions: bool = False, prefix: str = "ope
     posting = cleaned_posting(job.description, job.title)
     if posting:
         st.markdown(posting)
-    st.subheader(f"Match: {job.match_percent}%")
-    st.subheader("What matches")
-    if job.covered:
-        for line in job.covered:
-            st.markdown(f"- {line}")
-    else:
-        st.caption("No judged requirement matches.")
-    _possible_block(st, job, prefix)
-    st.subheader("What is missing")
-    if job.missing:
-        for line in job.missing:
-            st.markdown(f"- {line}")
-    else:
-        st.caption("Nothing in the judged requirements is missing.")
+    label = _match_label(job)
+    st.subheader(f"Match: {label}")
+    if label != "Not scored":
+        st.subheader("What matches")
+        if job.covered:
+            for line in job.covered:
+                st.markdown(f"- {line}")
+        else:
+            st.caption("No judged requirement matches.")
+        _possible_block(st, job, prefix)
+        st.subheader("What is missing")
+        if job.missing:
+            for line in job.missing:
+                st.markdown(f"- {line}")
+        else:
+            st.caption("Nothing in the judged requirements is missing.")
     notes = notes_for_display(job.notes, job.description)
     if notes:
         st.subheader("Notes")

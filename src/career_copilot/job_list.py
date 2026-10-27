@@ -1,9 +1,8 @@
 """Job list for phase 3.
 
-A search builds a few short queries, asks the local Grok login for https
-links, opens those pages, and keeps up to three jobs at 50 percent or above.
-The CV is used for the match. It is not sent to a job site and it is not
-stored in the job list.
+Automatic search builds one short query, asks the fast model for https
+links, opens pages until one is still open, and returns that job.
+A second query runs only when the first call returns no link.
 """
 
 from __future__ import annotations
@@ -16,7 +15,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -34,16 +32,11 @@ from career_copilot.search_intent import SearchConditions
 HIGH_MATCH = 70
 MIN_MATCH = 50
 MAX_SCORED = 5
-MAX_FETCHED = 12
-WEB_SCORED = 4
 WEB_SHOWN = 3
-SEARCH_TIMEOUT_SECONDS = 360
-_SCORE_RESERVE_SECONDS = 40
-_QUERY_LIMIT = 4
-_QUERY_TIMEOUT_SECONDS = 90
-_OPEN_FLOOR_SECONDS = 90
+_CALL_TIMEOUT_SECONDS = 60
 FALLBACK_REASON = "Nada foi encontrado, então retornamos a vaga com o maior match com o seu CV."
 EMPTY_REASON = "Nada foi encontrado."
+UNSCORED_NOTE = "The match was not scored."
 DEADLINE_NOTE = "The application deadline was not found."
 _POSTING_CAP = 8000
 _FETCH_CAP = 24000
@@ -436,7 +429,10 @@ def visible_jobs(log: SearchLog) -> list[ListedJob]:
     for job in log.kept:
         add(job)
     latest = [job for job in log.latest if job_key(job) not in skipped and job_key(job) not in kept]
-    qualified = [job for job in latest if job.match_percent >= MIN_MATCH]
+    unscored = [job for job in latest if _unscored(job)]
+    if unscored:
+        add(unscored[0])
+    qualified = [job for job in latest if job.match_percent >= MIN_MATCH and not _unscored(job)]
     if qualified:
         ranked = sorted(qualified, key=lambda job: job.match_percent, reverse=True)
         for job in ranked[:WEB_SHOWN]:
@@ -612,6 +608,16 @@ def real_search(
     return log
 
 
+def _unscored(job: ListedJob) -> bool:
+    return (
+        not job.covered
+        and not job.partial
+        and not job.missing
+        and not job.assumed
+        and UNSCORED_NOTE in job.notes
+    )
+
+
 def _search_web(
     cv_text: str,
     roles: list[WorkRole],
@@ -626,89 +632,127 @@ def _search_web(
     log: SearchLog,
     blocked: set[str],
 ) -> SearchLog:
-    started = time.monotonic()
-
-    def remaining() -> int:
-        return max(0, SEARCH_TIMEOUT_SECONDS - int(time.monotonic() - started))
+    del cv_text, score
+    if discover is not None:
+        progress("Opening the page.")
+        for opening in discover():
+            if opening.url in blocked or not _opening_is_open(opening, today):
+                continue
+            return _save_open_job(log, opening, path)
+        return _save_nothing(log, path)
 
     removed = sorted(url for url in blocked if url.startswith("https://"))
-
-    def usable(openings: list[_Opening]) -> list[_Opening]:
-        prepared = [_with_posting(opening) for opening in openings]
-        return [
-            opening
-            for opening in prepared
-            if opening.url not in blocked
-            and fits_language(opening.text, conditions)
-            and _web_candidate(opening, cv_text, roles, skills, today)
-        ]
-
-    if discover is not None:
-        progress("Searching.")
-        found_pages = list(discover())
-    else:
-        found_pages = _discover_with_grok(
-            roles,
-            conditions,
-            skills,
-            cv_text=cv_text,
-            progress=progress,
-            skipped=removed,
-            time_left=remaining,
-            note_path=path,
-        )
-    candidates = usable(found_pages)
-    traits = load_traits(traits_for_jobs(path))
-    qualified: list[ListedJob] = []
-    weaker: list[ListedJob] = []
-    for index, opening in enumerate(candidates, start=1):
-        if len(qualified) >= WEB_SHOWN:
-            break
-        if remaining() <= 0 and (qualified or weaker):
-            break
-        progress(f"Scoring {index} of {len(candidates)}.")
+    queries = _short_queries(roles, skills, conditions)
+    for query in queries:
+        progress(f"Searching with {FAST_MODEL}.")
         try:
-            raw = _opening_points(opening, cv_text, roles, conditions, score, remaining())
+            links = _links_for_query(query, skipped=removed, timeout_seconds=_CALL_TIMEOUT_SECONDS)
         except CareerCopilotError as exc:
-            if "too long" not in str(exc).casefold():
-                raise
+            if "too long" not in str(exc).casefold() and "fast model" not in str(exc).casefold():
+                if "did not return a search" not in str(exc).casefold():
+                    raise
+            links = []
+        if not links:
             continue
-        judged, answered = _judge(raw, traits)
-        judged.extend(_condition_gaps(opening, conditions))
-        judged.extend(_language_gap(opening, conditions))
-        judged.extend(_level_gap(opening, conditions))
-        percent = match_percent(judged)
-        if percent is None:
-            continue
-        listed = _listed(
-            opening,
-            percent,
-            judged,
-            conditions,
-            answered=answered,
-            deadline_missing=_needs_deadline_note(opening),
-        )
-        if percent >= MIN_MATCH:
-            qualified.append(listed)
-        else:
-            weaker.append(listed)
-    qualified.sort(key=lambda job: job.match_percent, reverse=True)
-    shown = qualified[:WEB_SHOWN]
-    log.below_count = len(weaker)
-    log.high_count = sum(1 for job in shown if job.match_percent >= HIGH_MATCH)
-    if shown:
-        log.latest = shown
-        log.found_count = len(shown)
-        log.reason = ""
-    elif weaker:
-        best = max(weaker, key=lambda job: job.match_percent)
-        log.latest = [best]
-        log.found_count = 0
-        log.reason = FALLBACK_REASON
-    else:
-        log.latest = []
-        log.found_count = 0
-        log.reason = EMPTY_REASON
+        progress("Opening the page.")
+        for item in links:
+            url = str(item.get("url", "")).strip()
+            if not url.startswith("https://") or url in blocked:
+                continue
+            try:
+                page = fetch_posting(url)
+            except CareerCopilotError:
+                continue
+            opening = _opening_from_page(item, url, page)
+            if not _opening_is_open(opening, today):
+                continue
+            return _save_open_job(log, opening, path)
+        # The first call returned links. A second query runs only when there are none.
+        break
+    return _save_nothing(log, path)
+
+
+def _short_queries(roles: list[WorkRole], skills: list[str], conditions: SearchConditions) -> list[str]:
+    """One short query, plus a second only for the caller to use when the first has no link."""
+
+    role_names = _unique_terms([role.name for role in roles if role.kept])[:2]
+    skill_names = _unique_terms(list(skills))[:3]
+    place_terms: list[str] = []
+    if conditions.country.strip():
+        place_terms.append(conditions.country.strip())
+    if any(item.casefold() == "remote" for item in conditions.workplaces):
+        place_terms.append("remote")
+    place = _or_group(place_terms)
+    job = "(job OR vacancy)"
+
+    def line(terms: list[str]) -> str:
+        return " ".join(part for part in (_or_group(terms), place, job) if part)
+
+    first = line(skill_names or role_names)
+    second = line(role_names) if skill_names and role_names else ""
+    queries = [query for query in (first, second) if query]
+    seen: set[str] = set()
+    chosen: list[str] = []
+    for query in queries:
+        key = query.casefold()
+        if key not in seen:
+            seen.add(key)
+            chosen.append(query)
+    return chosen[:2] or ["job OR vacancy"]
+
+
+def _opening_is_open(opening: _Opening, today: date) -> bool:
+    if not is_open(opening.closes_on, today):
+        return False
+    if _explicitly_closed(opening.text):
+        return False
+    deadline = _deadline_date(opening.text)
+    return deadline is None or deadline >= today
+
+
+def _opening_from_page(item: dict[str, object], url: str, page: str) -> _Opening:
+    text = prepare_posting(page)
+    title = " ".join(str(item.get("title") or "").split())
+    if not title:
+        title = next((line.lstrip("#").strip() for line in text.splitlines() if line.strip()), "Job")
+    company = " ".join(str(item.get("company") or "").split()) or "Unknown"
+    return _Opening(
+        title=title[:120],
+        company=company[:120],
+        url=url[:500],
+        location="",
+        workplace="",
+        text=prepare_posting(page, title),
+        source="Web",
+    )
+
+
+def _save_open_job(log: SearchLog, opening: _Opening, path: Path | None) -> SearchLog:
+    text = prepare_posting(opening.text, opening.title) or opening.text
+    listed = ListedJob(
+        title=opening.title[:120] or "Job",
+        company=opening.company[:120] or "Unknown",
+        url=opening.url,
+        source=opening.source or "Web",
+        match_percent=0,
+        description=text,
+        notes=[UNSCORED_NOTE],
+    )
+    log.latest = [listed]
+    log.found_count = 1
+    log.high_count = 0
+    log.below_count = 0
+    log.reason = ""
+    save_log(log, path)
+    return log
+
+
+def _save_nothing(log: SearchLog, path: Path | None) -> SearchLog:
+    log.latest = []
+    log.found_count = 0
+    log.high_count = 0
+    log.below_count = 0
+    log.reason = EMPTY_REASON
     save_log(log, path)
     return log
 
@@ -1104,65 +1148,6 @@ def _with_posting(opening: _Opening) -> _Opening:
     if text == opening.text:
         return opening
     return opening.model_copy(update={"text": text})
-
-
-def _web_candidate(
-    opening: _Opening,
-    cv_text: str,
-    roles: list[WorkRole],
-    skills: list[str],
-    today: date,
-) -> bool:
-    if not is_open(opening.closes_on, today):
-        return False
-    if _explicitly_closed(opening.text):
-        return False
-    deadline = _deadline_date(opening.text)
-    if deadline is not None and deadline < today:
-        return False
-    return _shares_cv_term(cv_text, f"{opening.title}\n{opening.text}", roles, skills)
-
-
-def _shares_cv_term(cv_text: str, posting: str, roles: list[WorkRole], skills: list[str]) -> bool:
-    cv_blob = cv_text.casefold()
-    post = posting.casefold()
-    cv_words = _folded_words(cv_text)
-    post_words = _folded_words(posting)
-    terms = [skill.strip() for skill in skills if skill.strip()]
-    terms.extend(role.name.strip() for role in roles if role.name.strip())
-    for term in terms:
-        folded = term.casefold()
-        if len(folded) < 2:
-            continue
-        if _term_in(cv_blob, folded) and _term_in(post, folded):
-            return True
-        phrase = _folded_words(term)
-        if phrase and _phrase_in(phrase, cv_words) and _phrase_in(phrase, post_words):
-            return True
-    return False
-
-
-def _folded_words(text: str) -> list[str]:
-    return [_fold_token(word) for word in re.findall(r"[a-z0-9+#]+", text.casefold())]
-
-
-def _fold_token(word: str) -> str:
-    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
-        return word[:-1]
-    return word
-
-
-def _phrase_in(phrase: list[str], words: list[str]) -> bool:
-    width = len(phrase)
-    if width == 0 or width > len(words):
-        return False
-    return any(words[index : index + width] == phrase for index in range(len(words) - width + 1))
-
-
-def _term_in(blob: str, term: str) -> bool:
-    if " " in term:
-        return term in blob
-    return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", blob) is not None
 
 
 _CLOSED_PHRASES = (
@@ -1610,14 +1595,6 @@ def _language_gap(opening: _Opening, conditions: SearchConditions) -> list[Match
     return [MatchPoint(text=f"The posting requires {named}, outside the saved languages.", status="no_match")]
 
 
-def _query_budget(remaining: int) -> int:
-    """Seconds for one short query, leaving time to open and score saved links."""
-
-    if remaining <= _OPEN_FLOOR_SECONDS:
-        return 0
-    return min(_QUERY_TIMEOUT_SECONDS, remaining - _OPEN_FLOOR_SECONDS)
-
-
 def _unique_terms(values: list[str]) -> list[str]:
     chosen: list[str] = []
     seen: set[str] = set()
@@ -1648,175 +1625,11 @@ def _or_group(terms: list[str]) -> str:
     return text
 
 
-def _place_terms(conditions: SearchConditions) -> list[str]:
-    """Filled Search fields only. An empty city does not add other cities."""
-
-    terms: list[str] = []
-    netherlands = conditions.country.strip().casefold() in _NL_COUNTRIES
-    for workplace in conditions.workplaces:
-        terms.append(workplace)
-        if workplace.casefold() == "hybrid" and netherlands:
-            terms.append("hybride")
-    if conditions.country.strip():
-        terms.append(conditions.country.strip())
-    if conditions.city.strip():
-        terms.append(conditions.city.strip())
-    return _unique_terms(terms)
-
-
-def _search_queries(roles: list[WorkRole], conditions: SearchConditions, skills: list[str]) -> list[str]:
-    """Three or four short queries. Empty fields and the CV text add nothing."""
-
-    role_names = _unique_terms([role.name for role in roles if role.kept])[:4]
-    skill_names = _unique_terms(list(skills))
-    place = _place_terms(conditions)
-    netherlands = conditions.country.strip().casefold() in _NL_COUNTRIES
-    listing = ["job", "vacature" if netherlands else "vacancy"]
-    queries: list[str] = []
-    seen: set[str] = set()
-
-    def add(text: str) -> None:
-        if len(queries) >= _QUERY_LIMIT:
-            return
-        cleaned = " ".join(text.split())
-        key = cleaned.casefold()
-        if cleaned and key not in seen:
-            seen.add(key)
-            queries.append(cleaned)
-
-    lead = skill_names[:4] or role_names
-    role_group = [name for name in role_names if name.casefold() not in {item.casefold() for item in lead}]
-    first = [part for part in (_or_group(lead), _or_group(role_group), _or_group(place), _or_group(["job", "vacancy", "apply now"])) if part]
-    add(" ".join(first))
-    if role_names:
-        second = [part for part in (_or_group(role_names), _or_group(["job", "vacancy"]), _or_group(place)) if part]
-        add(" ".join(second))
-    focus = skill_names[:2] or role_names[:1]
-    workplaces = list(conditions.workplaces)
-    if netherlands and any(item.casefold() == "hybrid" for item in workplaces):
-        workplaces.append("hybride")
-    third = [part for part in (_or_group(focus), _or_group(listing), _or_group(workplaces)) if part]
-    if conditions.country.strip():
-        third.append(conditions.country.strip())
-    elif conditions.city.strip():
-        third.append(conditions.city.strip())
-    add(" ".join(third))
-    extra = skill_names[4:8]
-    if extra:
-        more = [part for part in (_or_group(extra), _or_group(place), _or_group(["job", "vacancy"])) if part]
-        add(" ".join(more))
-    if len(queries) < 3 and skill_names and role_names:
-        add(f"{_or_join(skill_names[:2])} {_or_join(role_names)}".strip())
-    if len(queries) < 3 and place and (role_names or skill_names):
-        add(f"{_or_join(role_names or skill_names[:2])} {_or_group(['job', 'vacancy'])} {_or_group(place)}".strip())
-    return queries
-
-
-def _discover_with_grok(
-    roles: list[WorkRole],
-    conditions: SearchConditions,
-    skills: list[str],
-    cv_text: str = "",
-    progress: Callable[[str], None] | None = None,
-    skipped: list[str] | None = None,
-    time_left: Callable[[], int] | None = None,
-    note_path: Path | None = None,
-) -> list[_Opening]:
-    clock = time_left or (lambda: SEARCH_TIMEOUT_SECONDS)
-    items = _collect_search_links(
-        roles,
-        conditions,
-        skills,
-        cv_text=cv_text,
-        skipped=skipped,
-        time_left=clock,
-        progress=progress,
-        note_path=note_path,
-    )
-    return openings_from_search(
-        items,
-        fetch_posting,
-        conditions,
-        progress=progress,
-        time_left=time_left,
-    )
-
-
-def _collect_search_links(
-    roles: list[WorkRole],
-    conditions: SearchConditions,
-    skills: list[str],
-    *,
-    cv_text: str,
-    skipped: list[str] | None,
-    time_left: Callable[[], int],
-    progress: Callable[[str], None] | None,
-    note_path: Path | None = None,
-) -> list[dict[str, object]]:
-    queries = _search_queries(roles, conditions, skills)
-    saved: list[dict[str, object]] = []
-    seen: set[str] = set()
-    timed_out = False
-    failed = False
-    total = len(queries)
-    note = [f"model: {FAST_MODEL}"]
-    note.extend(f"query {index}: {query}" for index, query in enumerate(queries, start=1))
-    _write_search_note(note_path, note)
-    for index, query in enumerate(queries, start=1):
-        budget = _query_budget(time_left())
-        if budget < 1:
-            break
-        if progress is not None:
-            progress(f"Searching {index} of {total} with {FAST_MODEL}.")
-        try:
-            found = _links_for_query(
-                query,
-                conditions,
-                skipped=skipped,
-                timeout_seconds=budget,
-                cv_text=cv_text,
-            )
-        except CareerCopilotError as exc:
-            message = str(exc).casefold()
-            if "fast model" in message:
-                note.append(f"query {index}: the fast model was not used")
-                _write_search_note(note_path, note)
-                if progress is not None:
-                    progress("That call did not use the fast model. Continuing.")
-                continue
-            if "too long" in message:
-                timed_out = True
-                note.append(f"query {index}: stopped before it returned")
-                _write_search_note(note_path, note)
-                continue
-            if "did not return a search" in message:
-                failed = True
-                note.append(f"query {index}: no search result")
-                _write_search_note(note_path, note)
-                continue
-            raise
-        note.append(f"query {index} links: {len(found)}")
-        _write_search_note(note_path, note)
-        for item in found:
-            url = str(item.get("url", ""))
-            if url in seen:
-                continue
-            seen.add(url)
-            saved.append(item)
-    if saved:
-        return saved
-    if failed and not timed_out:
-        raise CareerCopilotError("Grok did not return a search. Stay signed in with grok login and try again.")
-    return []
-
-
 def _links_for_query(
     query: str,
-    conditions: SearchConditions,
     *,
-    skipped: list[str] | None,
-    timeout_seconds: int,
-    cv_text: str = "",
+    skipped: list[str] | None = None,
+    timeout_seconds: int = _CALL_TIMEOUT_SECONDS,
 ) -> list[dict[str, object]]:
     executable = shutil.which("grok")
     if executable is None:
@@ -1824,10 +1637,7 @@ def _links_for_query(
     with tempfile.TemporaryDirectory() as folder:
         directory = Path(folder)
         prompt_file = directory / "prompt.txt"
-        prompt_file.write_text(
-            _query_prompt(query, conditions, skipped=skipped, cv_text=cv_text),
-            encoding="utf-8",
-        )
+        prompt_file.write_text(_query_prompt(query), encoding="utf-8")
         try:
             completed = subprocess.run(
                 grok_search_argv(executable, prompt_file, directory),
@@ -1869,63 +1679,15 @@ def _links_for_query(
     return kept
 
 
-def _search_prompt(
-    roles: list[WorkRole],
-    conditions: SearchConditions,
-    skills: list[str],
-    cv_text: str = "",
-    skipped: list[str] | None = None,
-) -> str:
-    queries = _search_queries(roles, conditions, skills)
-    query = queries[0] if queries else "job OR vacancy"
-    return _query_prompt(query, conditions, skipped=skipped, cv_text=cv_text)
-
-
-def _query_prompt(
-    query: str,
-    conditions: SearchConditions,
-    skipped: list[str] | None = None,
-    cv_text: str = "",
-) -> str:
-    lines = [
-        "Use the fastest model available.",
-        "Search the public web for job postings that are still open.",
-        "Use one web search for the query below, then stop and return the JSON.",
-        "Do not open the pages. Do not run a second search.",
-        "A blank field is not a preference. Do not add a place, a workplace, or a year that is not listed.",
-        "Return only a JSON object with a jobs list.",
-        "Each item needs a title, a company, and one https url from the search results.",
-        "Do not copy an example link.",
-        "Rules:",
-        "- Use an https link to the employer or another public job page.",
-        "- Do not use LinkedIn.",
-        "- Do not invent a job, a company, or a link.",
-        "- Do not put the CV text into the web search.",
-        "- Do not score the CV.",
-        f"Query: {query}",
-    ]
-    removed = [url for url in (skipped or []) if url.startswith("https://")]
-    if removed:
-        lines.append("Do not return these links:")
-        lines.extend(removed[:40])
-    if conditions.notes.strip():
-        lines.append("Preferences:")
-        lines.append(conditions.notes.strip())
-        lines.append("Use the preferences as guidance. A preference does not by itself exclude a page.")
-    if cv_text.strip():
-        lines.append("Do not put the CV into the web search. The CV is judged after the pages are open.")
-    return "\n".join(lines) + "\n"
-
-
-def _write_search_note(path: Path | None, lines: list[str]) -> None:
-    """Queries and model id only. The CV is not written here."""
-
-    target = (jobs_path() if path is None else path).parent / "search-run.txt"
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except OSError:
-        return
+def _query_prompt(query: str) -> str:
+    return (
+        "Use the fastest model available.\n"
+        "Use one web search for the query below, then stop.\n"
+        "Return only https links of job postings that look open.\n"
+        "Each item needs a title, a company, and one https url.\n"
+        "Do not open the pages. Do not invent a job, a company, or a link. Do not use LinkedIn.\n"
+        f"Query: {query}\n"
+    )
 
 
 def _fast_model_used(stdout: str) -> bool:
@@ -2021,68 +1783,6 @@ def _jobs_from_text(text: str) -> list[dict[str, object]]:
         seen.add(url)
         jobs.append({"title": "", "company": "", "url": url})
     return jobs
-
-
-def openings_from_search(
-    items: list[dict[str, object]],
-    fetch: Callable[[str], str],
-    conditions: SearchConditions | None = None,
-    progress: Callable[[str], None] | None = None,
-    time_left: Callable[[], int] | None = None,
-) -> list[_Opening]:
-    chosen = conditions or SearchConditions()
-    planned: list[tuple[dict[str, object], str]] = []
-    seen: set[str] = set()
-    for item in items:
-        if len(planned) == MAX_FETCHED:
-            break
-        url = str(item.get("url", "")).strip()[:500]
-        if not url.startswith("https://") or url in seen:
-            continue
-        host = urllib.parse.urlparse(url).hostname or ""
-        if _blocked_job_host(host) or _private_host(host):
-            continue
-        seen.add(url)
-        planned.append((item, url))
-    openings: list[_Opening] = []
-    total = len(planned)
-    for index, (item, url) in enumerate(planned, start=1):
-        points = _points_from_raw(item.get("requirements"))
-        if time_left is not None and time_left() < _SCORE_RESERVE_SECONDS:
-            break
-        if progress is not None:
-            progress(f"Opening page {index} of {total}.")
-        try:
-            page = fetch(url)
-        except Exception:
-            continue
-        readable = readable_text(page)[:_FETCH_CAP]
-        if len(readable) < 200:
-            continue
-        title = " ".join(str(item.get("title") or "").split())
-        if not title:
-            title = next((line.lstrip("#").strip() for line in readable.splitlines() if line.strip()), "Job")
-        cleaned = prepare_posting(readable, title)
-        if len(cleaned) < 200:
-            continue
-        company = " ".join(str(item.get("company") or "").split()) or "Unknown"
-        location = _paste_location(cleaned, chosen)
-        if not location:
-            location = " ".join(str(item.get("location") or "").split())
-        openings.append(
-            _Opening(
-                title=title[:120],
-                company=company[:120],
-                url=url,
-                location=location[:200],
-                workplace=_mentioned_workplace(cleaned),
-                employment=_mentioned_employment(cleaned),
-                text=cleaned,
-                source="Web",
-                points=points,
-            )
-        )
-    return openings
 
 
 def _opening(

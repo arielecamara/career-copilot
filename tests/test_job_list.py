@@ -14,8 +14,7 @@ from career_copilot.job_list import (
     EMPTY_REASON,
     FALLBACK_REASON,
     HIGH_MATCH,
-    SEARCH_TIMEOUT_SECONDS,
-    WEB_SHOWN,
+    UNSCORED_NOTE,
     AssumedPoint,
     ListedJob,
     MatchPoint,
@@ -754,6 +753,48 @@ def test_jobs_page_has_no_samples(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert "The work is research." in visible
 
 
+def test_an_unscored_web_job_says_not_scored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    pytest.importorskip("streamlit")
+    from streamlit.testing.v1 import AppTest
+
+    monkeypatch.setenv("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    monkeypatch.chdir(tmp_path)
+    save_roles(tmp_path / ".career-copilot" / "roles.json", _roles())
+    save_search(_remote(), tmp_path / ".career-copilot" / "search.json")
+    save_log(
+        SearchLog(
+            latest=[
+                ListedJob(
+                    title="Knowledge engineer",
+                    company="Lab",
+                    url="https://jobs.example.org/open",
+                    source="Web",
+                    match_percent=0,
+                    description="Remote Neo4j researcher role.",
+                    notes=[UNSCORED_NOTE],
+                )
+            ],
+            found_count=1,
+        ),
+        tmp_path / ".career-copilot" / "jobs.json",
+    )
+    script = Path(__file__).parents[1] / "src" / "career_copilot" / "ui_app.py"
+    app = AppTest.from_file(str(script), default_timeout=60)
+    app.run()
+    app.sidebar.radio[0].set_value("Jobs").run()
+    assert not app.exception, app.exception
+    visible = "\n".join(
+        str(item.value)
+        for item in list(app.table) + list(app.markdown) + list(app.caption) + list(app.subheader)
+    )
+    assert "Not scored" in visible
+    assert "Match: 0%" not in visible
+    assert "What matches" not in visible
+    assert "What is missing" not in visible
+    assert UNSCORED_NOTE in visible
+    assert "https://jobs.example.org/open" in visible
+
+
 def test_jobs_page_searches_when_automatic_search_is_clicked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("streamlit")
     from streamlit.testing.v1 import AppTest
@@ -1006,66 +1047,66 @@ def test_sixty_percent_stays_and_a_senior_posting_needs_seventy_when_senior_was_
     assert contract.latest[0].missing == []
 
 
-def test_web_discovery_rescores_opened_pages_and_skips_a_dead_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from career_copilot.job_list import _search_prompt, openings_from_search
+def test_the_first_open_page_is_returned_and_a_dead_link_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from career_copilot.job_list import _CALL_TIMEOUT_SECONDS, _query_prompt, _short_queries
 
-    monkeypatch.setattr(
-        "career_copilot.job_list._discover_with_grok",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("grok")),
-    )
-    monkeypatch.setattr(
-        "career_copilot.job_list._default_feeds",
-        lambda: (_ for _ in ()).throw(AssertionError("feed")),
-    )
     page = "Remote researcher role in Utrecht. " * 12
     fetched: list[str] = []
-    opened: list[str] = []
+    calls: list[str] = []
+
+    def links(query: str, *, skipped=None, timeout_seconds: int = _CALL_TIMEOUT_SECONDS):
+        del skipped
+        calls.append(query)
+        assert timeout_seconds == 60
+        assert "SECRET" not in query
+        return [
+            {"title": "Ignored", "company": "In", "url": "https://www.linkedin.com/jobs/view/1"},
+            {"title": "Closed", "company": "Lab", "url": "https://jobs.example.org/dead"},
+            {"title": "Loop", "company": "Lab", "url": "https://127.0.0.1/jobs/secret"},
+            {"title": "Researcher", "company": "Lab", "url": "https://jobs.example.org/one"},
+            {"title": "Later", "company": "Lab", "url": "https://jobs.example.org/two"},
+        ]
 
     def fetch(url: str) -> str:
         fetched.append(url)
-        if "dead" in url:
+        if "dead" in url or "linkedin" in url or url.startswith("https://127.0.0.1"):
             raise CareerCopilotError("This page did not return the posting. Paste the text.")
         return page + " Guessed percent 90 must be ignored."
 
-    items = [
-        {"title": "Researcher", "company": "Lab", "url": "https://example.com/jobs/one", "match": 90},
-        {"title": "Ignored", "company": "In", "url": "https://www.linkedin.com/jobs/view/1"},
-        {"title": "Closed", "company": "Lab", "url": "https://example.com/jobs/dead"},
-        {"title": "Loop", "company": "Lab", "url": "https://127.0.0.1/jobs/secret"},
-    ]
-    openings = openings_from_search(items, fetch, _remote(), progress=opened.append)
-    assert opened == ["Opening page 1 of 2.", "Opening page 2 of 2."]
-    assert [item.url for item in openings] == ["https://example.com/jobs/one"]
-    assert openings[0].source == "Web"
-    assert "SECRET" not in openings[0].text
+    monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
+    monkeypatch.setattr("career_copilot.job_list.fetch_posting", fetch)
     scored: list[str] = []
     outcome = real_search(
         "SECRET CURRICULUM researcher",
         _roles(),
         _remote(),
-        score=lambda _cv, _posting: _points(1, 1),
-        discover=lambda: openings,
+        score=lambda _cv, _posting: scored.append("scored") or _points(1, 1),
         skills=["Neo4j"],
         path=tmp_path / "jobs.json",
         require_grok=False,
         progress=scored.append,
     )
-    assert scored == ["Searching.", "Scoring 1 of 1."]
-    assert outcome.latest[0].match_percent == 50
-    assert outcome.latest[0].match_percent != 90
+    assert calls and len(calls) == 1
+    assert scored == ["Searching with grok-4.7-build-fast.", "Opening the page."]
+    assert fetched == [
+        "https://www.linkedin.com/jobs/view/1",
+        "https://jobs.example.org/dead",
+        "https://127.0.0.1/jobs/secret",
+        "https://jobs.example.org/one",
+    ]
+    assert outcome.latest[0].url == "https://jobs.example.org/one"
+    assert outcome.latest[0].source == "Web"
+    assert outcome.latest[0].match_percent == 0
+    assert outcome.latest[0].notes == [UNSCORED_NOTE]
+    assert outcome.reason == ""
     assert "SECRET CURRICULUM" not in (tmp_path / "jobs.json").read_text(encoding="utf-8")
-    assert outcome.latest[0].notes[0] == "The application deadline was not found."
-    assert fetched == ["https://example.com/jobs/one", "https://example.com/jobs/dead"]
-    prompt = _search_prompt(_roles(), clean_conditions([], [], [], "", ""), ["Neo4j"])
+    assert "90" not in outcome.latest[0].notes
+    prompt = _query_prompt(_short_queries(_roles(), ["Neo4j"], clean_conditions([], [], [], "", ""))[0])
     assert "Neo4j" in prompt
     assert "Use one web search" in prompt
-    assert "at most 4" not in prompt
-    assert "A blank field is not a preference" in prompt
     assert "SECRET" not in prompt
     assert "site:linkedin" not in prompt
     assert "2026" not in prompt
-    assert "Prefer light programming" not in prompt
-    assert "requirements" not in prompt
     query_line = next(line for line in prompt.splitlines() if line.startswith("Query:"))
     assert "Remote" not in query_line
     assert "Amsterdam" not in query_line
@@ -1083,7 +1124,7 @@ def test_web_discovery_rescores_opened_pages_and_skips_a_dead_link(tmp_path: Pat
 
 
 def test_notes_guide_the_search_and_do_not_add_a_hard_gap(tmp_path: Path):
-    from career_copilot.job_list import _hard_languages, _scoring_text, _search_prompt, fits_language
+    from career_copilot.job_list import _hard_languages, _query_prompt, _scoring_text, _short_queries, fits_language
 
     dutch = "Uitstekende beheersing van de Engelse taal; Nederlands is een pré."
     assert _hard_languages(dutch) == {"English"}
@@ -1144,14 +1185,12 @@ def test_notes_guide_the_search_and_do_not_add_a_hard_gap(tmp_path: Path):
     )
     assert quiet.job is not None
     assert "The posting does not mention a language." in quiet.job.notes
-    prompt = _search_prompt(_roles(), noted, ["Neo4j"])
-    assert "at most 4" not in prompt
+    prompt = _query_prompt(_short_queries(_roles(), ["Neo4j"], noted)[0])
     assert "Use one web search" in prompt
-    assert "Light programming only." in prompt
-    assert "A preference does not by itself exclude a page." in prompt
-    assert "Prefer light programming" not in prompt
+    assert "Light programming only." not in prompt
     query_line = next(line for line in prompt.splitlines() if line.startswith("Query:"))
     assert "Light programming" not in query_line
+    assert "remote" in query_line.casefold()
     scored = _scoring_text("The posting body.", _roles(), noted)
     assert "Preferences:\nLight programming only." in scored
     assert "The posting body." in scored
@@ -1170,12 +1209,7 @@ def _web_opening(url: str, text: str, *, title: str = "Knowledge Graph Engineer"
     )
 
 
-def test_web_search_stops_at_three_and_keeps_four_minutes():
-    assert SEARCH_TIMEOUT_SECONDS == 360
-    assert WEB_SHOWN == 3
-
-
-def test_web_search_keeps_a_hybrid_job_and_names_a_missing_deadline(tmp_path: Path):
+def test_an_open_page_is_returned_without_a_match_score(tmp_path: Path):
     page = _web_opening(
         "https://example.com/jobs/cgi",
         "Hybrid Neo4j role for a researcher in Eindhoven. " * 8,
@@ -1184,7 +1218,7 @@ def test_web_search_keeps_a_hybrid_job_and_names_a_missing_deadline(tmp_path: Pa
         "Neo4j researcher",
         _roles(),
         clean_conditions(["Entry level"], ["Full-time"], ["Remote"], "Netherlands", ""),
-        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         discover=lambda: [page],
         skills=["Neo4j"],
         path=tmp_path / "jobs.json",
@@ -1192,13 +1226,14 @@ def test_web_search_keeps_a_hybrid_job_and_names_a_missing_deadline(tmp_path: Pa
         today=date(2026, 10, 21),
     )
     assert len(outcome.latest) == 1
-    assert outcome.latest[0].match_percent == 50
-    assert any("Hybrid" in line for line in outcome.latest[0].missing)
-    assert outcome.latest[0].notes[0] == DEADLINE_NOTE
+    assert outcome.latest[0].match_percent == 0
+    assert outcome.latest[0].missing == []
+    assert outcome.latest[0].notes == [UNSCORED_NOTE]
     assert outcome.reason == ""
+    assert visible_jobs(outcome) == outcome.latest
 
 
-def test_a_closed_page_and_a_page_without_overlap_stay_out(tmp_path: Path):
+def test_a_closed_page_is_skipped_and_overlap_is_ignored(tmp_path: Path):
     closed = _web_opening(
         "https://example.com/jobs/closed",
         "Applications are closed. Neo4j researcher role. " * 8,
@@ -1222,18 +1257,18 @@ def test_a_closed_page_and_a_page_without_overlap_stay_out(tmp_path: Path):
         "Neo4j researcher",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
-        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         discover=lambda: [closed, past, unrelated, future],
         skills=["Neo4j"],
         path=tmp_path / "jobs.json",
         require_grok=False,
         today=date(2026, 10, 21),
     )
-    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/open"]
-    assert DEADLINE_NOTE not in outcome.latest[0].notes
+    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/other"]
+    assert outcome.latest[0].notes == [UNSCORED_NOTE]
 
 
-def test_nothing_opened_and_a_low_score_use_the_two_empty_messages(tmp_path: Path):
+def test_nothing_opened_says_nothing_was_found(tmp_path: Path):
     empty = real_search(
         "Neo4j researcher",
         _roles(),
@@ -1246,31 +1281,41 @@ def test_nothing_opened_and_a_low_score_use_the_two_empty_messages(tmp_path: Pat
     )
     assert empty.reason == EMPTY_REASON
     assert visible_jobs(empty) == []
-    low = real_search(
+    closed = real_search(
         "Neo4j researcher",
         _roles(),
         clean_conditions([], [], [], "", ""),
-        score=lambda _cv, _posting: _points(1, 3),
+        score=_high,
         discover=lambda: [
-            _web_opening("https://example.com/jobs/low", "Remote Neo4j researcher role. " * 8, workplace="Remote")
+            _web_opening("https://example.com/jobs/closed", "Applications are closed. " * 8, workplace="Remote")
         ],
         skills=["Neo4j"],
-        path=tmp_path / "low.json",
+        path=tmp_path / "closed.json",
         require_grok=False,
     )
-    assert low.reason == FALLBACK_REASON
-    assert low.found_count == 0
-    assert len(visible_jobs(low)) == 1
-    assert visible_jobs(low)[0].match_percent < 50
+    assert closed.latest == []
+    assert closed.reason == EMPTY_REASON
+    fallback = SearchLog(
+        latest=[
+            ListedJob(
+                title="Low",
+                company="Lab",
+                url="https://example.com/jobs/low",
+                source="Web",
+                match_percent=40,
+                description="Remote role.",
+                covered=["Python"],
+                missing=["License", "Graph", "Dutch"],
+            )
+        ],
+        reason=FALLBACK_REASON,
+        found_count=0,
+    )
+    assert len(visible_jobs(fallback)) == 1
+    assert visible_jobs(fallback)[0].match_percent == 40
 
 
-def test_three_matches_stop_the_web_search(tmp_path: Path):
-    calls: list[str] = []
-
-    def score(_cv: str, posting: str) -> list[MatchPoint]:
-        calls.append(posting)
-        return [MatchPoint(text="Neo4j", status="match")]
-
+def test_the_first_open_page_stops_the_search(tmp_path: Path):
     pages = [
         _web_opening(f"https://example.com/jobs/{index}", "Remote Neo4j researcher role. " * 8, workplace="Remote")
         for index in range(4)
@@ -1279,15 +1324,15 @@ def test_three_matches_stop_the_web_search(tmp_path: Path):
         "Neo4j researcher",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         discover=lambda: pages,
         skills=["Neo4j"],
         path=tmp_path / "jobs.json",
         require_grok=False,
     )
-    assert len(calls) == 3
-    assert len(outcome.latest) == 3
-    assert len(visible_jobs(outcome)) == 3
+    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/0"]
+    assert len(visible_jobs(outcome)) == 1
+    assert outcome.latest[0].notes == [UNSCORED_NOTE]
 
 
 def test_an_assumed_point_waits_for_a_vote_and_then_counts(tmp_path: Path):
@@ -1298,55 +1343,37 @@ def test_an_assumed_point_waits_for_a_vote_and_then_counts(tmp_path: Path):
             MatchPoint(text="Works independently", status="assumed", basis="PhD"),
         ]
 
-    page = _web_opening(
-        "https://example.com/jobs/assumed",
-        "Remote Neo4j researcher role. Works independently. " * 6,
-        workplace="Remote",
-    )
-    first = real_search(
-        "Neo4j researcher with a PhD",
-        _roles(),
-        clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
-        discover=lambda: [page],
-        skills=["Neo4j"],
-        path=tmp_path / "jobs.json",
-        require_grok=False,
-    )
-    assert first.latest[0].match_percent == 50
-    assert first.latest[0].assumed[0].ask == "Works independently"
-    assert first.latest[0].assumed[0].basis == "PhD"
-    assert "Works independently" not in first.latest[0].covered
+    def paste(title: str):
+        return consider_posting(
+            "Neo4j researcher with a PhD",
+            f"{title}\nRemote Neo4j researcher role. Works independently. " * 4,
+            _roles(),
+            clean_conditions([], [], ["Remote"], "", ""),
+            score=score,
+            path=tmp_path / "jobs.json",
+            require_grok=False,
+        )
+
+    first = paste("Researcher one")
+    assert first.job is not None
+    assert first.job.match_percent == 50
+    assert first.job.assumed[0].ask == "Works independently"
+    assert first.job.assumed[0].basis == "PhD"
+    assert "Works independently" not in first.job.covered
     save_trait("Works independently", "PhD", "up", tmp_path / "traits.json")
-    second = real_search(
-        "Neo4j researcher with a PhD",
-        _roles(),
-        clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
-        discover=lambda: [page],
-        skills=["Neo4j"],
-        path=tmp_path / "jobs.json",
-        require_grok=False,
-    )
-    assert second.latest[0].match_percent == 67
-    assert second.latest[0].assumed == []
-    assert "Works independently" in second.latest[0].covered
+    second = paste("Researcher two")
+    assert second.job is not None
+    assert second.job.match_percent == 67
+    assert second.job.assumed == []
+    assert "Works independently" in second.job.covered
     save_trait("Works independently", "PhD", "down", tmp_path / "traits.json")
-    third = real_search(
-        "Neo4j researcher with a PhD",
-        _roles(),
-        clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
-        discover=lambda: [page],
-        skills=["Neo4j"],
-        path=tmp_path / "jobs.json",
-        require_grok=False,
-    )
-    assert third.latest[0].match_percent == 33
-    assert third.latest[0].assumed == []
-    assert third.latest[0].partial == []
-    assert "Works independently" not in third.latest[0].covered
-    assert "Works independently" in third.latest[0].missing
+    third = paste("Researcher three")
+    assert third.job is not None
+    assert third.job.match_percent == 33
+    assert third.job.assumed == []
+    assert third.job.partial == []
+    assert "Works independently" not in third.job.covered
+    assert "Works independently" in third.job.missing
     assert load_traits(tmp_path / "traits.json")[0].vote == "down"
     assert "Neo4j researcher with a PhD" not in (tmp_path / "jobs.json").read_text(encoding="utf-8")
 
@@ -1679,7 +1706,7 @@ def test_a_dutch_institution_is_not_a_required_language():
     assert _hard_languages("Uitstekende beheersing van de Engelse taal; Nederlands is een pré.") == {"English"}
 
 
-def test_a_dutch_description_stays_out_when_only_english_is_saved(tmp_path: Path):
+def test_language_checks_stay_for_paste_and_automatic_search_returns_the_first_open_page(tmp_path: Path):
     from career_copilot.job_list import body_language, fits_language
 
     dutch = (
@@ -1733,30 +1760,17 @@ def test_a_dutch_description_stays_out_when_only_english_is_saved(tmp_path: Path
         "Neo4j researcher",
         _roles(),
         english_only,
-        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         discover=lambda: [dutch_job, english_job],
         skills=["Neo4j"],
         path=tmp_path / "english.json",
         require_grok=False,
         today=date(2026, 10, 21),
     )
-    assert [job.url for job in hidden.latest] == ["https://example.com/jobs/geo"]
-    assert "For candidates" not in hidden.latest[0].description
-    assert "Australia" not in hidden.latest[0].description
+    assert [job.url for job in hidden.latest] == ["https://example.com/jobs/cgi"]
+    assert hidden.latest[0].match_percent == 0
+    assert hidden.latest[0].notes == [UNSCORED_NOTE]
     assert "Neo4j" in hidden.latest[0].description
-    assert deadline_on(hidden.latest[0].description) == date(2026, 11, 15)
-    shown = real_search(
-        "Neo4j researcher",
-        _roles(),
-        both,
-        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
-        discover=lambda: [dutch_job],
-        skills=["Neo4j"],
-        path=tmp_path / "both.json",
-        require_grok=False,
-        today=date(2026, 10, 21),
-    )
-    assert [job.url for job in shown.latest] == ["https://example.com/jobs/cgi"]
 
 
 def test_a_yes_on_a_possible_match_counts_on_the_next_search(tmp_path: Path):
@@ -1766,54 +1780,36 @@ def test_a_yes_on_a_possible_match_counts_on_the_next_search(tmp_path: Path):
             MatchPoint(text="PhD in GIScience or a related field", status="partial"),
         ]
 
-    page = _web_opening(
-        "https://example.com/jobs/phd",
-        "Remote Neo4j researcher role. PhD in GIScience or a related field. " * 4,
-        workplace="Remote",
-    )
-    first = real_search(
-        "Neo4j researcher",
-        _roles(),
-        clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
-        discover=lambda: [page],
-        skills=["Neo4j"],
-        path=tmp_path / "jobs.json",
-        require_grok=False,
-    )
-    assert first.latest[0].partial == ["PhD in GIScience or a related field"]
-    assert first.latest[0].answered == []
-    assert first.latest[0].match_percent == 75
+    def paste(title: str):
+        return consider_posting(
+            "Neo4j researcher",
+            f"{title}\nRemote Neo4j researcher role. PhD in GIScience or a related field. " * 4,
+            _roles(),
+            clean_conditions([], [], ["Remote"], "", ""),
+            score=score,
+            path=tmp_path / "jobs.json",
+            require_grok=False,
+        )
+
+    first = paste("Researcher one")
+    assert first.job is not None
+    assert first.job.partial == ["PhD in GIScience or a related field"]
+    assert first.job.answered == []
+    assert first.job.match_percent == 75
     save_trait("PhD in GIScience or a related field", "PhD in GIScience or a related field", "up", tmp_path / "traits.json")
-    second = real_search(
-        "Neo4j researcher",
-        _roles(),
-        clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
-        discover=lambda: [page],
-        skills=["Neo4j"],
-        path=tmp_path / "jobs.json",
-        require_grok=False,
-    )
-    assert second.latest[0].match_percent == 100
-    assert second.latest[0].partial == []
-    assert second.latest[0].answered == ["PhD in GIScience or a related field"]
-    assert "PhD in GIScience or a related field" in second.latest[0].covered
+    second = paste("Researcher two")
+    assert second.job is not None
+    assert second.job.match_percent == 100
+    assert second.job.partial == []
+    assert second.job.answered == ["PhD in GIScience or a related field"]
+    assert "PhD in GIScience or a related field" in second.job.covered
     save_trait("PhD in GIScience or a related field", "PhD in GIScience or a related field", "down", tmp_path / "traits.json")
-    third = real_search(
-        "Neo4j researcher",
-        _roles(),
-        clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
-        discover=lambda: [page],
-        skills=["Neo4j"],
-        path=tmp_path / "jobs.json",
-        require_grok=False,
-    )
-    assert third.latest[0].match_percent == 50
-    assert third.latest[0].partial == []
-    assert third.latest[0].answered == ["PhD in GIScience or a related field"]
-    assert "PhD in GIScience or a related field" in third.latest[0].missing
+    third = paste("Researcher three")
+    assert third.job is not None
+    assert third.job.match_percent == 50
+    assert third.job.partial == []
+    assert third.job.answered == ["PhD in GIScience or a related field"]
+    assert "PhD in GIScience or a related field" in third.job.missing
 
 
 def _sample_job() -> ListedJob:
@@ -2067,57 +2063,25 @@ def test_no_on_a_manual_result_moves_the_line_into_what_is_missing(tmp_path: Pat
     assert '"vote": "down"' in traits
 
 
-def test_a_slow_score_does_not_drop_the_next_page(tmp_path: Path):
-    calls: list[str] = []
-
-    def score(_cv: str, posting: str) -> list[MatchPoint]:
-        calls.append(posting)
-        if len(calls) == 1:
-            raise CareerCopilotError("Grok took too long. Nothing was saved.")
-        return [MatchPoint(text="Neo4j", status="match")]
-
-    pages = [
-        _web_opening("https://example.com/jobs/slow", "Remote Neo4j researcher role. " * 8, workplace="Remote"),
-        _web_opening("https://example.com/jobs/next", "Remote Neo4j researcher role. " * 8, workplace="Remote"),
-    ]
-    outcome = real_search(
-        "Neo4j researcher",
-        _roles(),
-        clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
-        discover=lambda: pages,
-        skills=["Neo4j"],
-        path=tmp_path / "jobs.json",
-        require_grok=False,
-    )
-    assert len(calls) == 2
-    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/next"]
-
-
-def test_a_guessed_search_requirement_is_scored_again(tmp_path: Path):
+def test_automatic_search_does_not_score_or_copy_guessed_points(tmp_path: Path):
     page = _web_opening(
         "https://example.com/jobs/plain",
         "Remote Neo4j researcher role. " * 8,
         workplace="Remote",
     ).model_copy(update={"points": [MatchPoint(text="Neo4j", status="match")]})
-    calls: list[str] = []
-
-    def score(_cv: str, _posting: str) -> list[MatchPoint]:
-        calls.append("scored")
-        return [MatchPoint(text="Python", status="match")]
-
     outcome = real_search(
         "Neo4j researcher",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
-        score=score,
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         discover=lambda: [page],
         skills=["Neo4j"],
         path=tmp_path / "jobs.json",
         require_grok=False,
     )
-    assert calls == ["scored"]
-    assert outcome.latest[0].covered == ["Python"]
+    assert outcome.latest[0].url == "https://example.com/jobs/plain"
+    assert outcome.latest[0].covered == []
+    assert outcome.latest[0].notes == [UNSCORED_NOTE]
 
 
 def test_a_long_search_requirement_is_kept():
@@ -2208,11 +2172,9 @@ def test_a_search_reply_keeps_real_links_and_drops_linkedin():
 
 
 def test_short_queries_use_saved_roles_skills_and_the_filled_place():
-    from career_copilot.job_list import _query_budget, _search_queries
+    from career_copilot.job_list import _CALL_TIMEOUT_SECONDS, _query_prompt, _short_queries
 
-    assert _query_budget(360) == 90
-    assert _query_budget(100) == 10
-    assert _query_budget(90) == 0
+    assert _CALL_TIMEOUT_SECONDS == 60
     roles = [
         WorkRole(name="knowledge engineer", reason="The work is knowledge."),
         WorkRole(name="researcher", reason="The work is research."),
@@ -2230,45 +2192,55 @@ def test_short_queries_use_saved_roles_skills_and_the_filled_place():
         "Pattern Recognition",
     ]
     netherlands = clean_conditions([], [], [], "Netherlands", "")
-    queries = _search_queries(roles, netherlands, skills)
-    assert 3 <= len(queries) <= 4
-    joined = "\n".join(queries)
-    assert "Knowledge Graphs" in joined
-    assert "Neo4j" in joined
-    assert "Ontology Design" in joined
-    assert "knowledge engineer" in joined
-    assert "researcher" in joined
-    assert "Netherlands" in joined
-    assert "vacature" in joined
-    assert "apply now" in queries[0]
+    queries = _short_queries(roles, skills, netherlands)
+    assert len(queries) == 2
+    assert "Knowledge Graphs" in queries[0]
+    assert "Neo4j" in queries[0]
+    assert "Ontology Design" in queries[0]
+    assert "Cypher" not in queries[0]
+    assert "Netherlands" in queries[0]
     assert "job" in queries[0] and "vacancy" in queries[0]
-    assert all("job" in query or "vacature" in query for query in queries)
+    assert "knowledge engineer" in queries[1]
+    assert "researcher" in queries[1]
     for query in queries:
         assert "2026" not in query
         assert "Amsterdam" not in query
         assert "Utrecht" not in query
         assert "Eindhoven" not in query
         assert "Remote" not in query
-    germany = clean_conditions(["Senior"], ["Full-time"], [], "Germany", "")
-    abroad = _search_queries(roles, germany, skills[:2])
+        assert "vacature" not in query
+    germany = clean_conditions(["Senior"], ["Full-time"], ["Hybrid"], "Germany", "Berlin", notes="Light programming only.")
+    abroad = _short_queries(roles, skills[:2], germany)
     assert abroad
-    assert all("vacature" not in query for query in abroad)
+    assert "Germany" in abroad[0]
     assert all("Senior" not in query and "Full-time" not in query for query in abroad)
-    city = clean_conditions([], [], ["Hybrid"], "Netherlands", "Delft")
-    placed = _search_queries(roles, city, skills[:2])
-    assert any("Delft" in query and "Hybrid" in query for query in placed)
-    assert all("Amsterdam" not in query for query in placed)
+    assert all("Berlin" not in query and "Hybrid" not in query and "Light" not in query for query in abroad)
+    remote = clean_conditions([], [], ["Remote"], "Netherlands", "Utrecht")
+    placed = _short_queries(roles, skills[:2], remote)[0]
+    assert "Netherlands" in placed
+    assert "remote" in placed.casefold()
+    assert "Utrecht" not in placed
+    prompt = _query_prompt(queries[0])
+    assert "Do not open the pages" in prompt
+    assert "LinkedIn" in prompt
+    assert "https://example.com/jobs/old" not in prompt
+    assert "SECRET" not in prompt
 
 
-def test_a_high_model_call_is_skipped_and_the_note_omits_the_cv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_a_high_model_call_is_skipped_and_the_cv_stays_out_of_the_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     page = "Remote Neo4j researcher role. " * 12
     calls: list[str] = []
 
-    def links(query: str, _conditions, *, skipped, timeout_seconds: int, cv_text: str = "") -> list[dict[str, str]]:
+    def links(query: str, *, skipped=None, timeout_seconds: int = 60) -> list[dict[str, str]]:
+        del skipped
         calls.append(query)
+        assert timeout_seconds == 60
+        assert "SECRETLINE" not in query
         if len(calls) == 1:
             raise CareerCopilotError("The fast model was not used.")
-        return [{"title": "Researcher", "company": "Lab", "url": "https://example.com/jobs/new"}]
+        return [{"title": "Researcher", "company": "Lab", "url": "https://jobs.example.org/new"}]
 
     monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
     monkeypatch.setattr("career_copilot.job_list.fetch_posting", lambda _url: page)
@@ -2277,77 +2249,70 @@ def test_a_high_model_call_is_skipped_and_the_note_omits_the_cv(tmp_path: Path, 
         "Neo4j researcher SECRETLINE",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
-        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         skills=["Neo4j"],
         path=path,
         require_grok=False,
     )
-    note = (tmp_path / "search-run.txt").read_text(encoding="utf-8")
-    assert "grok-4.7-build-fast" in note
-    assert "query 1:" in note
-    assert "the fast model was not used" in note
-    assert "SECRETLINE" not in note
-    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new"]
+    assert len(calls) == 2
+    assert not (tmp_path / "search-run.txt").exists()
+    assert "SECRETLINE" not in path.read_text(encoding="utf-8")
+    assert [job.url for job in outcome.latest] == ["https://jobs.example.org/new"]
+    assert outcome.latest[0].notes == [UNSCORED_NOTE]
 
 
-def test_removed_links_stay_out_and_a_later_stop_keeps_saved_links(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    from career_copilot.job_list import _search_prompt
-
-    prompt = _search_prompt(
-        _roles(),
-        clean_conditions([], [], [], "", ""),
-        ["Neo4j"],
-        skipped=["https://example.com/jobs/old", "paste:secret:pasted"],
-    )
-    assert "https://example.com/jobs/old" in prompt
-    assert "paste:secret" not in prompt
-    hidden = _search_prompt(_roles(), clean_conditions([], [], [], "", ""), ["Neo4j"], "SECRET CURRICULUM line")
-    assert "SECRET CURRICULUM" not in hidden
-    assert "Do not put the CV into the web search." in hidden
-    assert "Do not return these links:" in prompt
-    assert "Do not score the CV." in prompt
+def test_removed_links_stay_out_and_the_first_open_page_stops_the_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     page = "Remote Neo4j researcher role. " * 12
     calls: list[int] = []
+    fetched: list[str] = []
 
-    def links(_query: str, _conditions, *, skipped, timeout_seconds: int, cv_text: str = ""):
+    def links(_query: str, *, skipped=None, timeout_seconds: int = 60):
         calls.append(timeout_seconds)
+        assert skipped is not None
         assert "https://example.com/jobs/old" in skipped
-        assert "SECRET" not in cv_text or "SECRET CURRICULUM" not in _query
-        if len(calls) == 1:
-            return [
-                {"title": "Old", "company": "Lab", "url": "https://example.com/jobs/old"},
-                {"title": "Researcher", "company": "Lab", "url": "https://example.com/jobs/new"},
-            ]
-        raise CareerCopilotError("Grok took too long. Nothing was saved.")
+        assert "SECRET" not in _query
+        return [
+            {"title": "Old", "company": "Lab", "url": "https://example.com/jobs/old"},
+            {"title": "Researcher", "company": "Lab", "url": "https://jobs.example.org/new"},
+            {"title": "Later", "company": "Lab", "url": "https://jobs.example.org/later"},
+        ]
+
+    def fetch(url: str) -> str:
+        fetched.append(url)
+        return page
 
     monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
-    monkeypatch.setattr("career_copilot.job_list.fetch_posting", lambda _url: page)
+    monkeypatch.setattr("career_copilot.job_list.fetch_posting", fetch)
     path = tmp_path / "jobs.json"
     save_log(SearchLog(skipped_urls=["https://example.com/jobs/old"]), path)
     outcome = real_search(
-        "Neo4j researcher",
+        "Neo4j researcher SECRETLINE",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
-        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         skills=["Neo4j"],
         path=path,
         require_grok=False,
     )
-    assert len(calls) >= 2
-    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new"]
+    assert calls == [60]
+    assert fetched == ["https://jobs.example.org/new"]
+    assert [job.url for job in outcome.latest] == ["https://jobs.example.org/new"]
     assert outcome.skipped_urls == ["https://example.com/jobs/old"]
     assert outcome.reason == ""
 
 
-def test_a_query_that_does_not_answer_keeps_a_later_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_a_second_query_runs_only_when_the_first_returns_no_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     page = "Remote Neo4j researcher role. " * 12
-    calls: list[int] = []
+    calls: list[str] = []
 
-    def links(_query: str, _conditions, *, skipped, timeout_seconds: int, cv_text: str = ""):
-        calls.append(1)
+    def links(query: str, *, skipped=None, timeout_seconds: int = 60):
+        del skipped, timeout_seconds
+        calls.append(query)
         if len(calls) == 1:
             raise CareerCopilotError("Grok did not return a search. Stay signed in with grok login and try again.")
-        return [{"title": "Researcher", "company": "Lab", "url": "https://example.com/jobs/new"}]
+        return [{"title": "Researcher", "company": "Lab", "url": "https://jobs.example.org/new"}]
 
     monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
     monkeypatch.setattr("career_copilot.job_list.fetch_posting", lambda _url: page)
@@ -2355,17 +2320,47 @@ def test_a_query_that_does_not_answer_keeps_a_later_link(tmp_path: Path, monkeyp
         "Neo4j researcher",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
-        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         skills=["Neo4j"],
         path=tmp_path / "jobs.json",
         require_grok=False,
     )
-    assert len(calls) >= 2
-    assert [job.url for job in outcome.latest] == ["https://example.com/jobs/new"]
+    assert len(calls) == 2
+    assert calls[0] != calls[1]
+    assert [job.url for job in outcome.latest] == ["https://jobs.example.org/new"]
+
+    closed_calls: list[str] = []
+
+    def closed_links(query: str, *, skipped=None, timeout_seconds: int = 60):
+        del skipped, timeout_seconds
+        closed_calls.append(query)
+        return [{"title": "Closed", "company": "Lab", "url": "https://jobs.example.org/closed"}]
+
+    monkeypatch.setattr("career_copilot.job_list._links_for_query", closed_links)
+    monkeypatch.setattr(
+        "career_copilot.job_list.fetch_posting",
+        lambda _url: "Applications are closed. " * 20,
+    )
+    closed = real_search(
+        "Neo4j researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        skills=["Neo4j"],
+        path=tmp_path / "closed.json",
+        require_grok=False,
+    )
+    assert len(closed_calls) == 1
+    assert closed.latest == []
+    assert closed.reason == EMPTY_REASON
 
 
 def test_a_search_with_no_saved_link_reports_nothing_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    def links(_query: str, _conditions, *, skipped, timeout_seconds: int, cv_text: str = ""):
+    calls: list[int] = []
+
+    def links(_query: str, *, skipped=None, timeout_seconds: int = 60):
+        del skipped
+        calls.append(timeout_seconds)
         raise CareerCopilotError("Grok took too long. Nothing was saved.")
 
     monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
@@ -2373,33 +2368,11 @@ def test_a_search_with_no_saved_link_reports_nothing_found(tmp_path: Path, monke
         "Neo4j researcher",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
-        score=lambda _cv, _posting: [MatchPoint(text="Neo4j", status="match")],
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
         skills=["Neo4j"],
         path=tmp_path / "jobs.json",
         require_grok=False,
     )
+    assert calls == [60, 60]
     assert outcome.latest == []
     assert outcome.reason == "Nada foi encontrado."
-
-
-def test_opening_pages_stops_when_the_score_needs_the_remaining_time():
-    from career_copilot.job_list import openings_from_search
-
-    fetched: list[str] = []
-
-    def fetch(url: str) -> str:
-        fetched.append(url)
-        return "Remote Neo4j researcher role in Utrecht. " * 8
-
-    items = [
-        {"title": "Needs a score", "company": "Lab", "url": "https://example.com/jobs/slow"},
-        {
-            "title": "Researcher",
-            "company": "Lab",
-            "url": "https://example.com/jobs/ready",
-            "requirements": [{"text": "Neo4j", "status": "match"}],
-        },
-    ]
-    opened = openings_from_search(items, fetch, time_left=lambda: 10)
-    assert fetched == []
-    assert opened == []
