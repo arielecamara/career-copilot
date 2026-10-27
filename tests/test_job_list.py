@@ -1097,7 +1097,7 @@ def test_the_first_open_page_is_returned_and_a_dead_link_is_skipped(tmp_path: Pa
     assert "90" not in outcome.latest[0].notes
     prompt = _query_prompt(_short_queries(_roles(), ["Neo4j"], clean_conditions([], [], [], "", ""))[0])
     assert "Neo4j" in prompt
-    assert "Return only the first valid https link. Stop immediately." in prompt
+    assert "Return only valid https links for open jobs. Stop immediately." in prompt
     assert "Use one web search" in prompt
     assert "SECRET" not in prompt
     assert "site:linkedin" not in prompt
@@ -1229,42 +1229,72 @@ def test_an_open_page_is_returned_without_a_match_score(tmp_path: Path):
     assert visible_jobs(outcome) == outcome.latest
 
 
-def test_a_match_of_40_is_kept(tmp_path: Path):
-    forty = _web_opening(
-        "https://example.com/jobs/forty",
+def test_a_match_of_65_stops_and_a_lower_page_keeps_the_best(tmp_path: Path):
+    enough = _web_opening(
+        "https://example.com/jobs/enough",
         "Remote Neo4j and Cypher role. " * 8,
         workplace="Remote",
     )
-    kept = real_search(
+    stronger = _web_opening(
+        "https://example.com/jobs/stronger",
+        "Remote Neo4j Cypher and Python role. " * 8,
+        workplace="Remote",
+    )
+    stopped = real_search(
+        "Neo4j Cypher Python researcher",
+        _roles(),
+        clean_conditions([], [], ["Remote"], "", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        discover=lambda: [enough, stronger],
+        skills=["Neo4j", "Cypher", "Python"],
+        path=tmp_path / "stopped.json",
+        require_grok=False,
+    )
+    assert stopped.latest[0].url == "https://example.com/jobs/enough"
+    assert stopped.latest[0].match_percent == 67
+    assert stopped.latest[0].covered == ["Neo4j", "Cypher"]
+    assert visible_jobs(stopped) == stopped.latest
+    sixty = _web_opening(
+        "https://example.com/jobs/sixty",
+        "Remote Neo4j Cypher and Python role. " * 8,
+        workplace="Remote",
+    )
+    lower = _web_opening(
+        "https://example.com/jobs/lower",
+        "Remote Neo4j and Cypher role. " * 8,
+        workplace="Remote",
+    )
+    eighty = _web_opening(
+        "https://example.com/jobs/eighty",
+        "Remote Neo4j Cypher Python and SQL role. " * 8,
+        workplace="Remote",
+    )
+    reached = real_search(
         "Neo4j Cypher Python SQL Git researcher",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
         score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
-        discover=lambda: [forty],
+        discover=lambda: [sixty, lower, eighty],
         skills=["Neo4j", "Cypher", "Python", "SQL", "Git"],
-        path=tmp_path / "forty.json",
+        path=tmp_path / "reached.json",
         require_grok=False,
     )
-    assert kept.latest[0].match_percent == 40
-    assert kept.latest[0].covered == ["Neo4j", "Cypher"]
-    assert visible_jobs(kept) == kept.latest
-    thin = _web_opening(
-        "https://example.com/jobs/thin",
-        "Remote Neo4j role. " * 8,
-        workplace="Remote",
-    )
-    missed = real_search(
-        "Neo4j Cypher Python",
+    assert reached.latest[0].url == "https://example.com/jobs/eighty"
+    assert reached.latest[0].match_percent == 80
+    best = real_search(
+        "Neo4j Cypher Python SQL Git researcher",
         _roles(),
         clean_conditions([], [], ["Remote"], "", ""),
         score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
-        discover=lambda: [thin],
-        skills=["Neo4j", "Cypher", "Python"],
-        path=tmp_path / "thin.json",
+        discover=lambda: [lower, sixty],
+        skills=["Neo4j", "Cypher", "Python", "SQL", "Git"],
+        path=tmp_path / "best.json",
         require_grok=False,
     )
-    assert missed.latest == []
-    assert missed.reason == EMPTY_REASON
+    assert best.latest[0].url == "https://example.com/jobs/sixty"
+    assert best.latest[0].match_percent == 60
+    assert best.reason == ""
+    assert visible_jobs(best) == best.latest
 
 
 def test_a_closed_page_is_skipped_and_a_low_match_waits(tmp_path: Path):
@@ -1342,8 +1372,11 @@ def test_nothing_opened_says_nothing_was_found(tmp_path: Path):
         path=tmp_path / "low.json",
         require_grok=False,
     )
-    assert low_match.latest == []
-    assert low_match.reason == EMPTY_REASON
+    assert low_match.latest[0].url == "https://example.com/jobs/admin"
+    assert low_match.latest[0].match_percent == 0
+    assert low_match.latest[0].missing == ["Neo4j"]
+    assert low_match.reason == ""
+    assert visible_jobs(low_match) == low_match.latest
     quick = ListedJob(
         title="Quick",
         company="Lab",
@@ -1355,8 +1388,8 @@ def test_nothing_opened_says_nothing_was_found(tmp_path: Path):
         missing=["Cypher", "Python"],
     )
     assert visible_jobs(SearchLog(latest=[quick])) == [quick]
-    hidden = quick.model_copy(update={"match_percent": 39})
-    assert visible_jobs(SearchLog(latest=[hidden])) == []
+    low_shown = quick.model_copy(update={"match_percent": 39})
+    assert visible_jobs(SearchLog(latest=[low_shown])) == [low_shown]
     fallback = SearchLog(
         latest=[
             ListedJob(
@@ -2256,15 +2289,18 @@ def test_short_queries_use_saved_roles_skills_and_the_filled_place():
     ]
     netherlands = clean_conditions([], [], [], "Netherlands", "")
     queries = _short_queries(roles, skills, netherlands)
-    assert len(queries) == 2
+    assert len(queries) == 3
     assert "Knowledge Graphs" in queries[0]
     assert "Neo4j" in queries[0]
-    assert "Ontology Design" in queries[0]
-    assert "Cypher" not in queries[0]
+    assert "Ontology Design" not in queries[0]
+    assert "Ontology Design" in queries[1]
+    assert "Cypher" in queries[1]
+    assert "CIDOC-CRM" in queries[2]
+    assert "Python" in queries[2]
+    assert "Dataiku" not in " ".join(queries)
     assert "Netherlands" in queries[0]
     assert "job" in queries[0] and "vacancy" in queries[0]
-    assert "knowledge engineer" in queries[1]
-    assert "researcher" in queries[1]
+    assert "knowledge engineer" not in " ".join(queries)
     for query in queries:
         assert "2026" not in query
         assert "Amsterdam" not in query
@@ -2284,7 +2320,7 @@ def test_short_queries_use_saved_roles_skills_and_the_filled_place():
     assert "remote" in placed.casefold()
     assert "Utrecht" not in placed
     prompt = _query_prompt(queries[0])
-    assert "Return only the first valid https link. Stop immediately." in prompt
+    assert "Return only valid https links for open jobs. Stop immediately." in prompt
     assert "Do not open the pages" in prompt
     assert "LinkedIn" in prompt
     assert "https://example.com/jobs/old" not in prompt
@@ -2449,10 +2485,74 @@ def test_a_second_query_runs_when_the_first_page_is_missing_or_under_40(tmp_path
         path=tmp_path / "low.json",
         require_grok=False,
     )
-    assert len(fetched) == 2
-    assert opened == ["https://jobs.example.org/low", "https://jobs.example.org/new"]
-    assert [job.url for job in low.latest] == ["https://jobs.example.org/new"]
+    assert len(fetched) == 1
+    assert opened == ["https://jobs.example.org/low", "https://jobs.example.org/later"]
+    assert [job.url for job in low.latest] == ["https://jobs.example.org/later"]
     assert low.latest[0].match_percent == 100
+
+
+def test_three_queries_keep_the_best_page_under_65(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    skills = ["Neo4j", "Cypher", "Python", "SQL", "Git", "Data Modeling"]
+    cv = "Neo4j Cypher Python SQL Git Data Modeling researcher"
+    calls: list[str] = []
+    pages = {
+        "https://jobs.example.org/pair": "Remote Neo4j and Cypher role. " * 12,
+        "https://jobs.example.org/half": "Remote Neo4j Cypher and Python role. " * 12,
+        "https://jobs.example.org/one": "Remote Neo4j role. " * 12,
+        "https://jobs.example.org/four": "Remote Neo4j Cypher Python and SQL role. " * 12,
+    }
+
+    def links(query: str, *, skipped=None, timeout_seconds: int = 60):
+        del skipped, timeout_seconds
+        calls.append(query)
+        urls = [
+            "https://jobs.example.org/pair",
+            "https://jobs.example.org/half",
+            "https://jobs.example.org/one",
+        ]
+        url = urls[len(calls) - 1]
+        return [{"title": "Researcher", "company": "Lab", "url": url}]
+
+    monkeypatch.setattr("career_copilot.job_list._links_for_query", links)
+    monkeypatch.setattr("career_copilot.job_list.fetch_posting", lambda url: pages[url])
+    best = real_search(
+        cv,
+        _roles(),
+        clean_conditions([], [], ["Remote"], "Netherlands", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        skills=skills,
+        path=tmp_path / "best.json",
+        require_grok=False,
+    )
+    assert len(calls) == 3
+    assert calls[0] != calls[1] != calls[2]
+    assert "Netherlands" in calls[0]
+    assert "remote" in calls[0].casefold()
+    assert [job.url for job in best.latest] == ["https://jobs.example.org/half"]
+    assert best.latest[0].match_percent == 50
+    assert best.reason == ""
+
+    stopped_calls: list[str] = []
+
+    def stop_links(query: str, *, skipped=None, timeout_seconds: int = 60):
+        del skipped, timeout_seconds
+        stopped_calls.append(query)
+        url = "https://jobs.example.org/pair" if len(stopped_calls) == 1 else "https://jobs.example.org/four"
+        return [{"title": "Researcher", "company": "Lab", "url": url}]
+
+    monkeypatch.setattr("career_copilot.job_list._links_for_query", stop_links)
+    stopped = real_search(
+        cv,
+        _roles(),
+        clean_conditions([], [], ["Remote"], "Netherlands", ""),
+        score=lambda _cv, _posting: (_ for _ in ()).throw(AssertionError("scored")),
+        skills=skills,
+        path=tmp_path / "stopped.json",
+        require_grok=False,
+    )
+    assert len(stopped_calls) == 2
+    assert [job.url for job in stopped.latest] == ["https://jobs.example.org/four"]
+    assert stopped.latest[0].match_percent == 67
 
 
 def test_a_search_with_no_saved_link_reports_nothing_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
