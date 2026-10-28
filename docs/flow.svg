@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="220" viewBox="0 0 920 220" role="img" aria-label="Career Copilot flow: User, Search, Jobs, Documents">
+  <rect width="920" height="220" fill="#f7f6f3"/>
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif" text-anchor="middle">
+    <g>
+      <rect x="24" y="48" width="180" height="110" rx="12" fill="#1f3a34"/>
+      <text x="114" y="92" fill="#f7f6f3" font-size="22" font-weight="700">User</text>
+      <text x="114" y="122" fill="#d7e4df" font-size="14">Read one CV</text>
+      <text x="114" y="142" fill="#d7e4df" font-size="14">Keep the roles</text>
+    </g>
+    <g>
+      <rect x="254" y="48" width="180" height="110" rx="12" fill="#1f3a34"/>
+      <text x="344" y="92" fill="#f7f6f3" font-size="22" font-weight="700">Search</text>
+      <text x="344" y="122" fill="#d7e4df" font-size="14">Level, place, language</text>
+      <text x="344" y="142" fill="#d7e4df" font-size="14">No job search yet</text>
+    </g>
+    <g>
+      <rect x="484" y="48" width="180" height="110" rx="12" fill="#1f3a34"/>
+      <text x="574" y="92" fill="#f7f6f3" font-size="22" font-weight="700">Jobs</text>
+      <text x="574" y="122" fill="#d7e4df" font-size="14">Open vacancy or paste</text>
+      <text x="574" y="142" fill="#d7e4df" font-size="14">Match, then a CV</text>
+    </g>
+    <g>
+      <rect x="714" y="48" width="180" height="110" rx="12" fill="#1f3a34"/>
+      <text x="804" y="92" fill="#f7f6f3" font-size="22" font-weight="700">Documents</text>
+      <text x="804" y="122" fill="#d7e4df" font-size="14">Files on this computer</text>
+      <text x="804" y="142" fill="#d7e4df" font-size="14">You submit</text>
+    </g>
+    <path d="M208 103 H246" stroke="#1f3a34" stroke-width="3" fill="none"/>
+    <path d="M246 103 l-8 -6 v12 z" fill="#1f3a34"/>
+    <path d="M438 103 H476" stroke="#1f3a34" stroke-width="3" fill="none"/>
+    <path d="M476 103 l-8 -6 v12 z" fill="#1f3a34"/>
+    <path d="M668 103 H706" stroke="#1f3a34" stroke-width="3" fill="none"/>
+    <path d="M706 103 l-8 -6 v12 z" fill="#1f3a34"/>
+  </g>
+</svg>
