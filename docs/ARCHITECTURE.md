@@ -1,8 +1,8 @@
 # Architecture
 
-This file describes the program that opens today. `SPEC.md` and `AGENTS.md` still describe an older pipeline. That code remains in the repository. It is not on the four pages below.
+This file describes the program that opens today. `SPEC.md` is the contract for these four pages. `AGENTS.md` tells a later change to follow that contract. The older command-line path remains in the repository. It is not on the four pages below.
 
-The match rules are in `docs/MATCH.md`. They apply to every field. Synonyms come from a local ESCO name file, `src/career_copilot/data/esco_labels.json`, when that file is present. Terms are read only under a candidate heading, including Dutch headings such as functie-eisen and jouw profiel. A page with no such heading is saved with its link and is not shown as 100 percent. Menu fragments are left out of Possible matches.
+The match rules are in `docs/MATCH.md`. They apply to every field. Synonyms come from a local ESCO name file, `src/career_copilot/data/esco_labels.json`, when that file is present. Terms are read only under a candidate heading, including Dutch headings such as functie-eisen and jouw profiel. A page with no such heading is saved with its link and is not shown as 100 percent. Automatic search prefers an English page. A page in another language is saved only when no English page was opened. Menu fragments are left out of Possible matches.
 
 The program reads one CV, names the kinds of work that experience supports, searches for open jobs, and shows a match. The opened job can write a CV and, when the posting asks, a cover letter. Documents lists those files and records whether the person said they applied. The person reviews every file and submits the application. The program does not apply to jobs.
 
@@ -89,7 +89,7 @@ Not on the open pages:
 - Interview preparation is not on the page.
 - Mid-level is not an experience-level choice. The person can write that preference in Other notes.
 - A golden set of 15–20 CVs is not the check for these four pages.
-- `SPEC.md` and `AGENTS.md` still describe the older pipeline. This file and `Project-Vision-and-Next-Steps.pdf` describe the program that opens.
+- `SPEC.md` is the contract for the four pages. This file and `Project-Vision-and-Next-Steps.pdf` describe the program that opens. The older path is the section below.
 
 The modules below this section are the older pipeline. They remain in the repository. The page does not show them.
 
@@ -712,7 +712,7 @@ Tests:
 
 ## Current limitations
 
-The open pages' remaining work is in [Still to do](#still-to-do). The bullets below describe the older pipeline, including cases where a reader of `SPEC.md` might expect something else.
+The open pages' remaining work is in [Still to do](#still-to-do). The bullets below describe the older pipeline. They are not rules for the four pages.
 
 - The resume copies confirmed sentences. It reorders the skills block and may swap Postgres, PostgreSQL, and SQL. It does not rewrite a summary or a bullet into new prose.
 - Job headings are an exact closed set. A posting that says `Key Responsibilities` or `Required Technical Skills` contributes no requirement lines. The checklist then has little to tailor, and the diff's Refused section does not name the duties that were never parsed.
@@ -720,7 +720,7 @@ The open pages' remaining work is in [Still to do](#still-to-do). The bullets be
 - A line with two skills is `partial` when only one is supported. `or` does not mean "any skill," except for the degree groups.
 - A hands-on requirement is `met` from a `mentioned_only` skill atom when the line has no hands-on cue. With a hands-on cue, that same atom is only `partial`.
 - The years report is total confirmed employment. It is not years in one technology unless the constraint line itself names that technology.
-- `SPEC.md` says years use interval intersection. The code unions overlapping employment intervals and counts each day once. It does not add overlapping jobs, and it does not count only the overlapping region.
+- On the older path, years union overlapping employment intervals and count each day once. They do not add overlapping jobs, and they do not count only the overlapping region.
 - Conflict detection misses some real disagreements. It compares role headers across documents only when the employer strings are equal or one contains the other. The same degree at two differently written institutions is not a conflict. A publication date that differs inside two project atoms is not a date conflict unless both atoms are role headers.
 - The heading `training` switches later text to coursework until another known heading. In a long portfolio note, prose after that word can be labeled education.
 - Wrapped PDF lines are joined. Section numbers can be stored as metrics. A number range inside an identifier can be read as a date. Accented LaTeX text can survive as extracted characters.
@@ -736,7 +736,7 @@ The open pages' remaining work is in [Still to do](#still-to-do). The bullets be
 - Discarding a job record hides it on the Documents page and leaves the files on disk. Submitted is a local flag. The page does not apply to the job.
 - `career-copilot ui` listens on `127.0.0.1` only. It is not a shared server.
 - `profile.json` stores full source blocks and excerpts. It is a local sensitive file. The program does not upload it, and it also does not redact it.
-- The repository is not a git repository unless someone initializes one. Do not initialize or commit unless asked.
+- The project is a local git repository. Do not push unless the user asks in the chat.
 
 ## Intentionally not implemented
 
