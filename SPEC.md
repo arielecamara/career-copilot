@@ -1,232 +1,73 @@
-# AI Career Copilot — Engineering Spec v2.0
+# AI Career Copilot
 
-Version 2.0 — October 2026. Source: `../career-copilot/AI_Career_Copilot_Especificacao_Revisada_v2.pdf`.
+Version 3.0 — October 2026. This file is the product contract for the program that opens today.
 
-> Prefer verifiable honesty over theatrical autonomy.
-> "We adapt your real history to the job. You review. You decide what to submit."
+The program prepares a reading of one CV, a search for open jobs, a match, and the documents the person chooses to keep. The person reviews every file and submits the application. The program does not apply.
 
-The system prepares documents. The human submits them. Do not title or build this as an autonomous application.
+`docs/ARCHITECTURE.md` describes how that program runs. `docs/MATCH.md` is the match contract. If this file and those two disagree about the open pages, this file wins.
 
-## 1. Objective
+## 1. What it is
 
-Help a candidate adapt a resume and prepare for an interview in a traceable, reviewable way, without inventing facts.
+A local Python program and a Streamlit page on 127.0.0.1. There is no account, no public site, and no hosted copy of the CV.
 
-The value is a lower risk of submitting something untrue, and a tailoring pass the candidate can review and correct in under 5 minutes. The value is not an unsupervised package generated in 60 seconds.
+The model may propose roles, skill names, links, and draft sentences. Python accepts or rejects them. The model does not decide that a sentence is true, and it does not emit a score that authorizes a file.
 
-### Guarantees
+The page starts the `grok` program already signed in on this computer. It does not call `https://api.x.ai`. It cannot read the weekly allowance, so it does not enforce a spending cap.
 
-- Every claim points at a confirmed profile atom (`evidence_id`).
-- Changes are shown as a readable diff, including what was refused and why.
-- Gaps use the 3-state model below.
-- The candidate confirms the profile before any generation.
+## 2. The four pages
 
-### Refusals
+### User
 
-- Does not apply or submit for anyone.
-- Does not promise absolute zero hallucination.
-- Does not invent skills, dates, titles, metrics, or ownership verbs.
-- Does not reorder professional chronology.
+1. The person uploads one CV: a DOCX, or a single-column text PDF.
+2. Python reads the text on this computer. A scanned page or a multi-column file is refused in one sentence.
+3. Grok suggests at most eight roles, each with one sentence on why the experience supports it, and at most twelve skill names. A skill is kept only when that name appears in the CV.
+4. The page shows the roles. It does not show lines copied from the CV.
+5. The person keeps, removes, or types roles. Save writes the chosen roles. The CV text is stored locally and is not part of that roles file.
 
-## 2. Architecture
+### Search
 
-One linear pipeline. No persona agents and no CrewAI. LangGraph is allowed only as a state machine with explicit edges and a mandatory human checkpoint.
+Search does not look for jobs. It opens only after the roles are saved.
 
-| Stage | Name | Input | Output |
-| :---: | :--- | :--- | :--- |
-| 1 | Documents | DOCX, or a single-column text PDF: CV, certificates, portfolio notes | Raw document records |
-| 2 | Extraction | Stage 1 records | Master-profile atoms with `evidence_id`, evidence category, and source excerpt |
-| 3 | Human confirmation | Atoms and detected conflicts | Confirmed master profile. Required before generation |
-| 4 | Job analysis | Pasted job-description text | Requirements, hard constraints, and a status checklist |
-| 5 | Evidence selection | Confirmed profile + checklist | Chosen atoms, each tied to `evidence_id` |
-| 6 | Generation | Selected atoms + checklist | Tailored CV, optional cover letter, interview prep |
-| 7 | Deterministic validator | Generated assets + confirmed profile | Pass, or a violation report. Python only |
-| 8 | Diff and export | Passing assets + source CV | Readable diff and a single-column DOCX |
+No question is required. A blank answer is not a filter. The person may choose more than one experience level (Entry level, Senior, Manager, Director, Executive), employment type (Part-time, Full-time, Internship, Volunteer, Contract), and workplace (Local, Remote, Hybrid). There is no Mid-level choice.
 
-URL ingestion is secondary. It is out of the phase-1 core path because many job boards block scraping.
+No country means worldwide. A country without a city covers the whole country. Remote ignores the city. A typed language removes an automatic result written in another language, and a posting that requires a language that was not typed. A posting that does not show its language stays, with a note. Other notes guide the search and the match. They do not remove a job by themselves.
 
-## 3. Master profile
+### Jobs
 
-Structured output fixes shape. It does not make a statement true. Each fact is one atom.
+Jobs does not search when the page opens. The CV is not sent to a job site and is not copied into the job list.
 
-### Atom
+Automatic search builds two or three short queries from the saved skills, or from the kept roles when no skill is saved. Each query adds the saved country, and the word remote when Remote is selected. It asks the fast local model only for https links. Python opens up to three of those links. It drops LinkedIn, private addresses, empty pages, login walls, closed applications, and past deadlines. It keeps the first open page whose quick CV match is at least 65 percent. If none reach that, it keeps the best opened page. If no page was opened, the page says that nothing was found. A link the person already removed stays out.
 
-| Field | Required | Rule |
-| :--- | :---: | :--- |
-| `evidence_id` | yes | Stable id. Every later claim cites one or more ids. |
-| `statement` | yes | One factual claim, copied in meaning from the source excerpt. |
-| `category` | yes | `used_in_job`, `project`, `coursework`, or `mentioned_only`. |
-| `confirmation` | yes | `extracted`, then `confirmed`. `externally_verified` is future work, not MVP. |
-| `source_document_id` | yes | Document the excerpt came from. |
-| `source_excerpt` | yes | Verbatim span from that document. |
-| `employer` | no | Exact string when the atom is a role fact. |
-| `title` | no | Exact job title when the atom is a role fact. |
-| `start_date`, `end_date` | no | Exact dates. Open-ended roles use a null `end_date`. |
-| `metrics` | no | Numbers copied exactly. No rounding and no inferred numbers. |
-| `skills` | no | Skills named by the excerpt. This list is the skill whitelist for that atom. |
-| `ownership_verb` | no | Verb as written in the source, if one is present. |
+Manual search is one box. The person pastes the posting, or one public https link. The CV is not sent to that site. LinkedIn, a private address, an empty page, and a login wall ask for the text instead. A paste is listed when it reaches 50 percent.
 
-### Confirmation rules
+The opened job shows the cleaned posting, the match percent, what matches, possible matches, what is missing, notes, and the documents. Yes moves a possible line to what matches, raises the percent, and saves that the person knows it. No moves it to what is missing and saves that the person does not. An unanswered line is not saved. Neither answer changes the CV. The same answer is reused when the wording matches a later vacancy.
 
-1. Human confirmation happens before the first generation.
-2. Conflicts between documents are shown. There is no silent merge.
-3. Lifecycle is explicit: extracted automatically, then confirmed by the candidate, then externally verified later.
-4. Evidence category is one of the four values above. `mentioned_only` cannot be rewritten as hands-on production ownership.
+Keep this job keeps that vacancy on the next search. Remove this job drops it, and a later search skips that link.
 
-## 4. Gaps and hard constraints
+### Documents
 
-"Not in the profile" does not mean "the candidate does not know this." The system only knows that it found no evidence.
+Every opened job can write a CV. A cover letter is written only when the posting asks for a cover letter or a letter of motivation. Portfolio, transcript, writing sample, certificate, and identity documents are named only when the posting names them. They are not generated.
 
-| State | Meaning | Where it may appear |
-| :--- | :--- | :--- |
-| Proven | A confirmed atom supports it | CV and cover letter |
-| Not reported | No atom supports it | Ask the candidate, or mark `unknown`. Do not fill it in |
-| Confirmed gap | The candidate confirmed they do not have it | Interview prep only |
+The written CV is one A4 column, with no photo and no table. Experience, education, publications, languages, and contact stay word for word. Only the summary and the technical skills may change, and only with facts already in the saved CV. A sentence that adds an employer, title, date, number, or skill that is not already there is dropped. If a locked section would change, nothing is written.
 
-Hard constraints are boolean filters, never similarity scores. Examples: citizenship, work authorization, a compulsory license, minimum years of experience. Each result is `pass`, `fail`, or `unknown`.
+Documents lists those files and whether the person said they applied. The program does not submit them.
 
-Years of experience use interval intersection across roles. Overlapping jobs are not added together.
+## 3. Match
 
-## 5. Requirement checklist
+The match compares the saved skills, education, and kept roles with the candidate requirements in the vacancy. Employer text, benefits, salary, and the deadline are not part of the match.
 
-Semantic similarity is not professional qualification. "Joined a project that used AWS" is not "administered AWS in production." Hard constraints stay `pass`, `fail`, or `unknown` and never become a score.
+A match is the same concept or a true synonym. A missing match is a requirement the profile does not contain. A possible match is related or uncertain, including a named tool, method, or product whose exact name is not on the profile. The person answers Yes or No. The percent and the weights are defined in `docs/MATCH.md`.
 
-The checklist may show one tally. `met` counts 1, `partial` counts 0.5, and `missing` counts 0. `unknown` is excluded. The percentage is that tally divided by the number of judged requirements. It is not a similarity score and it does not decide whether a sentence is allowed.
+## 4. What stays off the page
 
-Each requirement has:
+- The program does not apply to jobs.
+- It does not scrape LinkedIn. A LinkedIn posting is pasted by the person.
+- It does not invent a job, a link, or a fact.
+- Interview preparation is not on the page.
+- A 15–20 CV comparison set is not part of this contract.
 
-- `text` — the requirement, from the pasted job description.
-- `kind` — `mandatory` or `preferred`. These two lists stay separate.
-- `status` — `met`, `partial`, `missing`, or `unknown`.
-- `evidence_ids` — required for `met` and `partial`. Empty for `missing` and `unknown`.
-- `excerpt` — the profile excerpt that supports `met` or `partial`.
+Personal files stay on this computer and out of git. That includes the CV, the role and search files, the job list, the Yes and No answers, generated documents, and any profile JSON.
 
-## 6. Generation rules
+## 5. Earlier pipeline
 
-### Resume
-
-- Keep employment chronology unchanged. Recruiters and ATS read it in reverse chronological order.
-- For a profile that does not include the original CV file below, rewrite only the summary, the skills block, and bullets inside each existing role.
-- Do not add roles, employers, titles, dates, or metrics.
-- An ownership verb (`led`, `owned`, `architected`, `responsible for`, and any verb added to the same table) is allowed only when the source atom already has that verb or a verb the table marks as equal or stronger.
-- Synonyms come from an explicit table. Initial allowed pair: `Postgres` ↔ `PostgreSQL` ↔ `SQL`. `Docker` must not become `Kubernetes`. A missing pair means the rewrite keeps the original term.
-
-### Original CV
-
-When the open profile includes `sample-cv.pdf` and that file is in the project folder, the written resume starts from that file.
-
-- Only the summary and the Technical Skills section may change, and only to align with the pasted job.
-- A skill is written only when that same skill is already in that file and its atom is confirmed.
-- Roles, bullets, dates, employers, education, publications, and every other section are copied from that file.
-- The page shows one column. Under the preview, only the summary and Technical Skills can be edited. The validator still runs before a file is written.
-
-### Cover letter (optional)
-
-- Optional. A required cover letter increases the invention surface.
-- It may name a gap in plain language.
-- It may connect one real piece of work to one real requirement.
-- It must not invent current company problems, culture, or anything that fills the space between the profile and the job.
-
-### Interview prep
-
-- Talking points, each citing `evidence_id`.
-- A "what not to say" list for unsupported claims and for verbs or skills the validator would reject.
-- Gap strategy: say the gap, then give adjacent confirmed evidence when it exists.
-- Questions for the candidate to ask.
-
-## 7. Deterministic validator
-
-The model proposes. Python decides. An LLM must not be the judge.
-
-Reject the package when any of these fail:
-
-- A generated sentence has no confirmed `evidence_id`.
-- Employer, title, dates, or numbers differ from the confirmed atom. Near matches fail.
-- An ownership verb is above the atom's allowed level.
-- A skill is outside the confirmed profile whitelist.
-- A confirmed gap, or a skill absent from the profile, appears in the CV or is implied in the cover letter.
-
-### Adversarial CI test
-
-Inject a required skill that is absent from the confirmed profile. The build fails if that skill appears on the CV or is suggested in the cover letter.
-
-## 8. Phase-1 MVP
-
-Phase 1 runs locally: a command-line tool and a Streamlit page bound to 127.0.0.1. No FastAPI, no public web app, no browser extension, no cloud accounts, and no auto-apply until the metrics in section 9 beat a plain LLM baseline.
-
-| Week | Focus | Done when |
-| :---: | :--- | :--- |
-| 1 | Confirmable profile | DOCX and single-column text PDF parse into the atom schema. Conflicts are detected. A human can confirm or edit in the CLI. Golden set holds 15–20 real CVs. |
-| 2 | Job analysis | Pasted text becomes requirements plus hard constraints. Checklist uses the four statuses. Years do not double-count overlap. |
-| 3 | Generation and validator | Fixed ATS resume template. CV generator and optional cover letter. Python validator and the adversarial CI test. Readable markdown diff. |
-| 4 | Export and prep | CLI runs the full path. Single-column DOCX export. Interview prep includes "what not to say". p95 latency is measured on an already confirmed profile. |
-
-Week-4 success: zero assertions without `evidence_id` on the golden set, a diff a person can use, and human review plus correction under 5 minutes.
-
-### Build order
-
-1. Atom schema and confirmation states.
-2. Deterministic validator and the adversarial test, before generation prompts.
-3. Parsers and conflict detection.
-4. Minimal confirmation CLI.
-5. Job analysis and the years calculation.
-6. Constrained generation.
-7. Diff and DOCX export.
-8. Interview prep.
-
-### Stack
-
-- Python 3.11+.
-- Pydantic for every model boundary.
-- `pdfplumber` and `python-docx`.
-- Gemini or GPT-4o only behind structured output. They propose text. They do not validate it.
-- LangGraph only if the pipeline needs an explicit state machine.
-
-## 9. Metrics before any larger UI
-
-Compare each package with the same CV and job description given to a plain ChatGPT or Claude session:
-
-1. Unsupported assertions.
-2. Changed facts (dates, titles, verbs, metrics).
-3. Candidate review time.
-4. Manual corrections.
-5. Perceived quality of the three documents.
-6. Cost and latency per package.
-
-## 10. Data
-
-Resumes and certificates are sensitive. Store them locally. Record purpose, retention, and deletion. Do not add a hosted account system in phase 1.
-
-## 11. Cut from the original proposal
-
-| Item | Decision |
-| :--- | :--- |
-| "Zero-hallucination" as a promise | Removed |
-| Calling generation deterministic | Removed. The flow and the validator are deterministic |
-| Multi-agent personas | Removed |
-| URL scraper as the core input | Secondary |
-| Reordering chronology | Forbidden |
-| One match score | Forbidden |
-| Mandatory cover letter | Optional |
-| Inferring the employer's current problems | Forbidden |
-| Decorative or multi-column PDF | Avoided |
-| FastAPI in phase 1 | Out of scope |
-
-## 12. Pasted-job model phase
-
-Locked on 19 October 2026. This section is the contract for the work that follows phase 1. Search feeds are not part of it.
-
-The candidate pastes a job. A model may read that posting and propose requirements, evidence ids, and a draft. Python checks every id and every sentence. The candidate confirms the job before a resume is drafted. A cover letter is drafted only when the posting asks for one and the candidate confirms that document too. A portfolio, a writing sample, or a transcript is named and is not drafted.
-
-When the original CV file is `sample-cv.pdf`, the draft copies that file. The model may propose a new summary and a new Technical Skills section. It may not propose a new role, bullet, date, employer, education line, or publication. Python still rejects a skill that the file does not already contain.
-
-The percentage remains the checklist tally in section 5. It does not authorize a sentence. Years and hard constraints stay on the deterministic calculation. The model does not replace them.
-
-A model call is sent only when all three are true:
-
-1. `CAREER_COPILOT_MODEL` is `on`.
-2. `XAI_API_KEY` is set in the environment. The key is not stored in the repository or the profile.
-3. `CAREER_COPILOT_QUOTA_USD` is the quota the candidate already has, as a positive number of dollars.
-
-The app may spend at most 10 percent of that quota on a calendar day. The output length of a call is capped so the worst case fits under the remainder. At the cap the app does not send the call and says `Stopped. Reached the daily limit.` No purchase, no invoice, and no auto top-up belong to this phase. CV text is not written to logs.
-
-While any of the three is missing, no call is made. The local checklist and the resume built from confirmed sentences are the result. English postings are the first reader. A cheaper model scores a posting. A stronger model drafts. LinkedIn stays paste-only. The app does not apply.
+The repository still contains an earlier command-line path: document atoms, human confirmation, a pasted-job checklist, a deterministic validator, and a single-column DOCX. That path is not on the four pages. New work on the open program follows the sections above. Do not extend the earlier path unless this file says so.

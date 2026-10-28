@@ -13,9 +13,7 @@ The page that opens has four steps. Each step waits for the person.
 3. **Jobs.** Automatic search asks the local Grok login for links to open vacancies, then Python opens those pages. The person can also paste a posting or one public link. The result shows what matches, what might match, and what is missing. Yes or No on a possible line is saved on this computer and does not change the CV. Generate CV writes one PDF for that job. Only the summary and the technical skills may change, and only with facts already in the CV. A cover letter is written only when the posting asks for one.
 4. **Documents.** Lists the CVs written on this computer and whether the person said they applied. Nothing is submitted.
 
-`docs/ARCHITECTURE.md` describes this program. `docs/MATCH.md` describes how a vacancy is scored.
-
-`SPEC.md` is an older contract. It describes a command-line pipeline: confirmed profile atoms, a pasted job, a validator, and a DOCX. That code is still in the repository and is not on these four pages. The pages above are the program a visitor runs.
+`SPEC.md` is the contract for these four pages. `docs/ARCHITECTURE.md` describes the running program. `docs/MATCH.md` describes how a vacancy is scored. An older command-line path remains in the code and is not on the menu.
 
 ## Run
 
