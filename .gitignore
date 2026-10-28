@@ -7,5 +7,16 @@ dist/
 build/
 profile.json
 sample-cv.pdf
+sample-cv.pdf
 LatexThesis_1Vr.pdf
 out/
+.env
+*.env
+cv.txt
+roles.json
+skills.json
+search.json
+jobs.json
+traits.json
+applications.json
+*.docx
